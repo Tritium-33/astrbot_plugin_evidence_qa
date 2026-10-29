@@ -82,7 +82,7 @@ class SelectionBridge:
                 and plugin_context is self.plugin.context
             ):
                 apply_to_request(state, req)
-                if state.get("visual_context"):
+                if state.get("visual_context") and state["plan"].route != "delegate":
                     # Already seen by the planner; avoid a second quote-caption model call.
                     quote_ref = None
             return req, quote_ref

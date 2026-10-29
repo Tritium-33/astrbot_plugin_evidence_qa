@@ -213,13 +213,15 @@ class EvidenceQAPlugin(Star):
             return
         question = event.get_message_str()
         attachments = media.collect(event)
-        if not question.strip() and not any(
-            attachments[k] for k in ("refs", "quotes", "faces")
+        chat_context = media.chat_context(event)
+        if (
+            not question.strip()
+            and not chat_context.get("group_chat_plus")
+            and not any(attachments[k] for k in ("refs", "quotes", "faces"))
         ):
             return
-        question = question.strip() or "用户发送了图片或表情，请结合当前对话自然回应。"
+        question = question.strip() or "请结合当前对话回应这条消息及其附件。"
         started = asyncio.get_running_loop().time()
-        chat_context = media.chat_context(event)
         state = {
             "trace_id": uuid4().hex,
             "question": question,
@@ -267,14 +269,15 @@ class EvidenceQAPlugin(Star):
             catalogue = self.catalogue.scope(names)
             image_urls = []
             planner = provider
-            if attachments["refs"]:
-                planner = await self.vision_provider_id(event)
-                state["vision_provider"] = planner
-                async with self.window(event, self.limits["retrieval_timeout_seconds"]):
-                    image_urls = await media.prepare(
-                        event, self.context.get_config(umo=event.unified_msg_origin)
-                    )
-                state["media"] = media.describe(attachments)
+            config = self.context.get_config(umo=event.unified_msg_origin)
+            async with self.window(event, self.limits["retrieval_timeout_seconds"]):
+                await media.resolve_quotes(event, config)
+                attachments = media.collect(event)
+                if attachments["refs"]:
+                    planner = await self.vision_provider_id(event)
+                    state["vision_provider"] = planner
+                    image_urls = await media.prepare(event, config)
+            state["media"] = media.describe(attachments)
             state["planner_provider"] = planner
             result = await self.ask(
                 planner,
@@ -317,7 +320,8 @@ class EvidenceQAPlugin(Star):
                 event.set_extra("selected_provider", planner)
             state["writer_provider"] = await self.selected_provider_id(event)
             state["describe_images_only"] = bool(
-                state.get("visual_context")
+                plan.route != "delegate"
+                and state.get("visual_context")
                 and state["writer_provider"] != state.get("vision_provider")
             )
             event.set_extra(
@@ -336,7 +340,7 @@ class EvidenceQAPlugin(Star):
             raise
         except Exception as error:  # noqa: BLE001 - native/provider boundary
             # An image or emoji must not become silent merely because planning failed.
-            if attachments["refs"] or attachments["faces"]:
+            if any(attachments[k] for k in ("refs", "quotes", "faces")):
                 state.update(
                     plan=Plan("delegate", question),
                     status="planned",
