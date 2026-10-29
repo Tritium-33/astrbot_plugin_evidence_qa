@@ -1,7 +1,7 @@
 name: astrbot_plugin_evidence_qa
 display_name: 证据问答与会话路由
-desc: 私聊联网与本地资料路由、按需来源、简短闲聊及LivingMemory隔离
-version: v0.3.0
+desc: 私聊与群聊看图、三路检索路由、按需来源、简短闲聊及私聊记忆隔离
+version: v0.4.0
 author: Tritium-33
 repo: https://github.com/Tritium-33/astrbot_plugin_evidence_qa
 astrbot_version: '==4.29.3'

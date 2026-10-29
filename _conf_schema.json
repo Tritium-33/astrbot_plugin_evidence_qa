@@ -1,6 +1,6 @@
 {
   "enabled": {
-    "description": "启用私聊路由与证据问答（含WebChat，不含Live）",
+    "description": "启用私聊、群聊及WebChat路由（不含Live；不主动唤醒消息）",
     "type": "bool",
     "default": true
   },
@@ -43,5 +43,16 @@
     "default": 15,
     "type": "float",
     "description": "每个网页正文读取的超时秒数（大于0，且受检索总预算约束）"
+  },
+  "enable_group": {
+    "description": "接管已被原生规则或Group Chat Plus触发的群聊回复",
+    "default": true,
+    "type": "bool"
+  },
+  "vision_provider_id": {
+    "description": "图片理解与看图聊天的Provider ID（填支持图片输入的Gemini等；留空用原生图片描述模型，再回退当前模型）",
+    "_special": "select_provider",
+    "default": "",
+    "type": "string"
   }
 }

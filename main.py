@@ -15,7 +15,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 
-from . import prompts, web
+from . import media, prompts, web
 from .catalogue import Catalogue, EvidenceStore
 from .evidence import (
     Packet,
@@ -24,6 +24,7 @@ from .evidence import (
     direct_answer,
     focused_review,
     history_text,
+    json_object,
     render,
     source_label,
 )
@@ -33,11 +34,12 @@ from .memory import MEMORY_STEPS, SKIP_MEMORY, MemoryBridge
 STATE = "evidence_qa.state"
 
 
-class BufferedPrivateChat(filter.CustomFilter):
+class BufferedChat(filter.CustomFilter):
     plugin = None
 
     def filter(self, event, cfg):
         if self.plugin and self.plugin.enabled(event):
+            media.collect(event)
             event.set_extra("enable_streaming", False)
         return False
 
@@ -62,7 +64,7 @@ class EvidenceQAPlugin(Star):
         self.evidence_store = EvidenceStore(folder / "evidence.json")
         self.memory = MemoryBridge()
         self.selection = SelectionBridge(self)
-        BufferedPrivateChat.plugin = self
+        BufferedChat.plugin = self
 
     async def initialize(self):
         from astrbot.core import astr_main_agent
@@ -75,19 +77,26 @@ class EvidenceQAPlugin(Star):
                 logger.warning("[证据问答] 缓存读取失败：%s", cache.path.name)
         self.selection.install(astr_main_agent, internal)
         logger.info(
-            "[证据问答] AstrBot 4.29.3：接管3个入口；目录仅加载缓存，更新请用 /资料目录更新。"
+            "[证据问答] AstrBot 4.29.3：接管%d个入口；目录仅加载缓存，更新请用 /资料目录更新。",
+            len(self.selection.patches),
         )
 
     def enabled(self, event):
         selected = getattr(event, "plugins_name", None)
         return (
             self.config.get("enabled", True)
-            and event.get_message_type() == MessageType.FRIEND_MESSAGE
+            and (
+                event.get_message_type() == MessageType.FRIEND_MESSAGE
+                or (
+                    event.get_message_type() == MessageType.GROUP_MESSAGE
+                    and self.config.get("enable_group", True)
+                )
+            )
             and event.get_extra("action_type") != "live"
             and (selected is None or "astrbot_plugin_evidence_qa" in selected)
         )
 
-    @filter.custom_filter(BufferedPrivateChat, False)
+    @filter.custom_filter(BufferedChat, False, priority=100)
     async def buffer_reply(self, event: AstrMessageEvent):
         pass
 
@@ -121,6 +130,18 @@ class EvidenceQAPlugin(Star):
             raise ValueError("没有可用的文本模型")
         return provider.meta().id
 
+    async def vision_provider_id(self, event):
+        explicit = self.config.get("vision_provider_id", "").strip()
+        if explicit:
+            return explicit
+        settings = self.context.get_config(umo=event.unified_msg_origin).get(
+            "provider_settings", {}
+        )
+        caption = settings.get("default_image_caption_provider_id", "")
+        if caption:
+            return caption
+        return await self.selected_provider_id(event)
+
     def window(self, event, limit):
         state = event.get_extra(STATE) if event else None
         if state and "deadline" in state:
@@ -136,11 +157,11 @@ class EvidenceQAPlugin(Star):
         steps = event.get_extra(MEMORY_STEPS, {})
         state["memory_recall_skipped"] = steps.get("recall")
         state["memory_record_skipped"] = steps.get("reflection")
-        state["memory_isolated"] = all(
+        state["memory_isolated"] = not state.get("group", False) and all(
             steps.get(k) is True for k in ("recall", "reflection")
         )
 
-    async def ask(self, provider, system, payload, event=None):
+    async def ask(self, provider, system, payload, event=None, image_urls=None):
         start = asyncio.get_running_loop().time()
         try:
             async with self.window(event, self.limits["model_timeout_seconds"]):
@@ -150,6 +171,7 @@ class EvidenceQAPlugin(Star):
                     prompt=json.dumps(payload, ensure_ascii=False, default=str),
                     contexts=[],
                     tools=None,
+                    image_urls=image_urls or [],
                 )
             return response.completion_text
         finally:
@@ -190,15 +212,24 @@ class EvidenceQAPlugin(Star):
         if not self.enabled(event) or event.get_extra(STATE) is not None:
             return
         question = event.get_message_str()
-        if not question.strip():
+        attachments = media.collect(event)
+        if not question.strip() and not any(
+            attachments[k] for k in ("refs", "quotes", "faces")
+        ):
             return
+        question = question.strip() or "用户发送了图片或表情，请结合当前对话自然回应。"
         started = asyncio.get_running_loop().time()
+        chat_context = media.chat_context(event)
         state = {
             "trace_id": uuid4().hex,
             "question": question,
             "status": "planning",
             "started": started,
             "deadline": started + self.limits["turn_timeout_seconds"],
+            "media": media.describe(attachments),
+            "group": event.get_message_type() == MessageType.GROUP_MESSAGE,
+            "sender_id": chat_context["sender_id"],
+            "sender_name": chat_context["sender_name"],
         }
         event.set_extra(STATE, state)
         try:
@@ -211,8 +242,13 @@ class EvidenceQAPlugin(Star):
                     else None
                 )
                 names, top_k = await self.selected_kbs(event)
-            # No CID means no durable cross-turn lookup; do not combine unrelated sessions.
-            scope = [event.unified_msg_origin, cid or state["trace_id"]]
+            # GCP supplies its own history and may never create a native conversation.
+            session = cid or (
+                "group_chat_plus"
+                if chat_context.get("group_chat_plus")
+                else state["trace_id"]
+            )
+            scope = [event.unified_msg_origin, session]
             state.update(scope=scope, kb_names=names, top_k=top_k)
             history = json.loads(conv.history) if conv and conv.history else []
             provider = await self.provider_id(event)
@@ -222,27 +258,43 @@ class EvidenceQAPlugin(Star):
                     "question": r["question"],
                     "items": [i["text"] for i in r["items"]],
                     "has_answer": bool(r.get("answer")),
+                    "sender_id": r.get("sender_id", ""),
                 }
                 for r in self.evidence_store.recent(scope)
             ]
             for record in recent[:-4]:
                 record.pop("items")
             catalogue = self.catalogue.scope(names)
-            plan = Plan.parse(
-                await self.ask(
-                    provider,
-                    prompts.PLAN,
-                    {
-                        "message": question,
-                        "history": history_text(history),
-                        "local_catalogue": catalogue,
-                        "recent_answers": recent,
-                        "now": datetime.now().astimezone().isoformat(),
-                    },
-                    event,
-                ),
-                question,
+            image_urls = []
+            planner = provider
+            if attachments["refs"]:
+                planner = await self.vision_provider_id(event)
+                state["vision_provider"] = planner
+                async with self.window(event, self.limits["retrieval_timeout_seconds"]):
+                    image_urls = await media.prepare(
+                        event, self.context.get_config(umo=event.unified_msg_origin)
+                    )
+                state["media"] = media.describe(attachments)
+            state["planner_provider"] = planner
+            result = await self.ask(
+                planner,
+                prompts.PLAN,
+                {
+                    "message": question,
+                    "history": history_text(history),
+                    "local_catalogue": catalogue,
+                    "recent_answers": recent,
+                    "now": datetime.now().astimezone().isoformat(),
+                    "media": state["media"],
+                    "chat_context": chat_context,
+                },
+                event,
+                image_urls=image_urls,
             )
+            plan = Plan.parse(result, question)
+            observation = json_object(result).get("visual_context", "")
+            if image_urls and isinstance(observation, str):
+                state["visual_context"] = observation.strip()
             allowed = {d["kb_name"] for d in catalogue}
             plan.kb_names = [n for n in plan.kb_names if n in allowed]
             if plan.local_only:
@@ -257,7 +309,17 @@ class EvidenceQAPlugin(Star):
                 target = self.config.get("research_provider_id", "").strip()
                 if target and not event.get_extra("selected_provider"):
                     event.set_extra("selected_provider", target)
+            elif (
+                plan.route == "chat"
+                and image_urls
+                and not event.get_extra("selected_provider")
+            ):
+                event.set_extra("selected_provider", planner)
             state["writer_provider"] = await self.selected_provider_id(event)
+            state["describe_images_only"] = bool(
+                state.get("visual_context")
+                and state["writer_provider"] != state.get("vision_provider")
+            )
             event.set_extra(
                 SKIP_MEMORY,
                 plan.exclude_memory
@@ -273,6 +335,25 @@ class EvidenceQAPlugin(Star):
             event.set_extra(SKIP_MEMORY, True)
             raise
         except Exception as error:  # noqa: BLE001 - native/provider boundary
+            # An image or emoji must not become silent merely because planning failed.
+            if attachments["refs"] or attachments["faces"]:
+                state.update(
+                    plan=Plan("delegate", question),
+                    status="planned",
+                    error=type(error).__name__,
+                    visual_fallback=True,
+                )
+                if state.get("vision_provider") and not event.get_extra(
+                    "selected_provider"
+                ):
+                    event.set_extra("selected_provider", state["vision_provider"])
+                event.set_extra(SKIP_MEMORY, False)
+                logger.warning(
+                    "[证据问答 %s] 图片规划失败，交给原生看图回复：%s",
+                    state["trace_id"],
+                    type(error).__name__,
+                )
+                return
             state.update(
                 plan=Plan("unavailable", question),
                 status="planning_failed",
@@ -336,7 +417,7 @@ class EvidenceQAPlugin(Star):
                     asyncio.get_running_loop().time() - start, 3
                 )
 
-    @filter.on_llm_request(priority=100)
+    @filter.on_llm_request(priority=-100)
     async def prepare_evidence(self, event: AstrMessageEvent, req: ProviderRequest):
         state = event.get_extra(STATE)
         if not self.enabled(event) or not state:
@@ -347,6 +428,22 @@ class EvidenceQAPlugin(Star):
             state["scope"] = [event.unified_msg_origin, req.conversation.cid]
         if plan.route == "delegate":
             return
+        media.apply_to_request(state, req)
+        if state.get("group"):
+            req.system_prompt = (req.system_prompt or "") + "\n\n" + prompts.GROUP
+            req.extra_user_content_parts.append(
+                TextPart(
+                    text="当前发言者："
+                    + json.dumps(
+                        {"id": state["sender_id"], "name": state["sender_name"]},
+                        ensure_ascii=False,
+                    )
+                )
+            )
+        if state.get("media", {}).get("image_count") or state.get("media", {}).get(
+            "face_ids"
+        ):
+            req.system_prompt = (req.system_prompt or "") + "\n\n" + prompts.VISUAL
         if plan.route != "research":
             req.func_tool = None
         if plan.route == "chat":
@@ -544,7 +641,9 @@ class EvidenceQAPlugin(Star):
         )
         if state["plan"].route == "memory_control":
             resp.completion_text = (
-                "这轮已跳过记忆召回和记录，已有记忆没改动。"
+                "这轮已请求跳过回复相关记忆；群消息自动采集不在此控制范围内。"
+                if state.get("group")
+                else "这轮已跳过记忆召回和记录，已有记忆没改动。"
                 if state["memory_isolated"]
                 else "这轮已请求不保存，但尚未确认记忆插件执行了跳过。"
             )
@@ -594,6 +693,7 @@ class EvidenceQAPlugin(Star):
                         "id": state["trace_id"],
                         "scope": state["scope"],
                         "question": state["plan"].question,
+                        "sender_id": state.get("sender_id", ""),
                         "answer": resp.completion_text,
                         "items": items,
                         "sources": [s for s in packet.sources if s["id"] in used]
@@ -663,5 +763,5 @@ class EvidenceQAPlugin(Star):
     async def terminate(self):
         self.selection.close()
         self.memory.close()
-        if BufferedPrivateChat.plugin is self:
-            BufferedPrivateChat.plugin = None
+        if BufferedChat.plugin is self:
+            BufferedChat.plugin = None
