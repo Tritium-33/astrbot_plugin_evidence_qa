@@ -46,6 +46,18 @@ class BufferedChat(filter.CustomFilter):
             self.plugin.routing.attach_gcp()
             media.collect(event)
             event.set_extra("enable_streaming", False)
+            if self.plugin.routing.direct_group(event):
+                if event.get_sender_id() == event.get_self_id():
+                    event.stop_event()
+                    return False
+                raw = event.message_obj.raw_message
+                if (
+                    isinstance(raw, dict)
+                    and raw.get("post_type", "message") != "message"
+                ):
+                    return False
+                if event.get_message_str().strip() or event.get_messages():
+                    return True
         return False
 
 
@@ -106,7 +118,10 @@ class EvidenceQAPlugin(Star):
 
     @filter.custom_filter(BufferedChat, False, priority=10000)
     async def buffer_reply(self, event: AstrMessageEvent):
-        pass
+        # Run after native access and session-plugin checks, before GCP's handler.
+        if self.routing.direct_group(event):
+            event.is_at_or_wake_command = True
+            event.set_extra("evidence_qa.direct_group", True)
 
     @filter.command("回答模式")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -290,6 +305,7 @@ class EvidenceQAPlugin(Star):
             "deadline": started + self.limits["turn_timeout_seconds"],
             "media": media.describe(attachments),
             "group": event.get_message_type() == MessageType.GROUP_MESSAGE,
+            "direct_group": bool(event.get_extra("evidence_qa.direct_group")),
             "sender_id": chat_context["sender_id"],
             "sender_name": chat_context["sender_name"],
         }

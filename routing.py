@@ -108,6 +108,20 @@ class ModelRouting:
             raise ValueError("请填写辅助模型 Provider ID")
         return identity
 
+    def direct_group(self, event):
+        """Opt-in group messages use native replies while retaining group identity."""
+        if (
+            event.get_message_type() != MessageType.GROUP_MESSAGE
+            or not self.plugin.enabled(event)
+            or not self.config.get("direct_reply_groups")
+        ):
+            return False
+        return self.direct_group_id(event.get_group_id(), event.get_platform_id())
+
+    def direct_group_id(self, group_id, platform_id):
+        groups = self.config.get("direct_reply_groups", [])
+        return str(group_id) in groups or f"{platform_id}:{group_id}" in groups
+
     def role(self, state):
         if not state.get("group"):
             return "private"
@@ -171,6 +185,8 @@ class ModelRouting:
     def attach_gcp(self):
         """GCP's independent proactive generation does not enter the native runner."""
         for name, module in list(sys.modules.items()):
+            if "group_chat_plus" in name and name.endswith(".main"):
+                self._attach_group_gate(module)
             if "group_chat_plus" in name and name.endswith(".utils.decision_ai"):
                 self._attach_decision(module)
             if "group_chat_plus" not in name or not name.endswith(
@@ -200,6 +216,13 @@ class ModelRouting:
                     chat_id,
                     chat_key,
                 ):
+                    if (
+                        not is_private
+                        and self.config.get("enabled", True)
+                        and self.config.get("enable_group", True)
+                        and self.direct_group_id(chat_id, platform_id)
+                    ):
+                        return
                     if self.enabled and self.config.get("enabled", True):
                         if is_private and not self.owner(chat_id, platform_id):
                             return
@@ -223,6 +246,23 @@ class ModelRouting:
             self.gcp_patches.append(
                 (owner, "_process_proactive_chat_simplified", descriptor, replacement)
             )
+
+    def _attach_group_gate(self, module):
+        owner = getattr(module, "ChatPlus", None)
+        if owner is None or any(p[0] is owner for p in self.gcp_patches):
+            return
+        original = owner.__dict__.get("_is_enabled")
+        if not callable(original):
+            return
+
+        @wraps(original)
+        def enabled(instance, event):
+            if event.get_extra("evidence_qa.direct_group"):
+                return False
+            return original(instance, event)
+
+        owner._is_enabled = enabled
+        self.gcp_patches.append((owner, "_is_enabled", original, enabled))
 
     def _attach_decision(self, module):
         owner = getattr(module, "DecisionAI", None)
