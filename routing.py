@@ -15,6 +15,7 @@ GPT_ROLES = {
     "chat": ("gpt_chat_provider_id", "chat_effort", "low"),
     "analysis": ("gpt_analysis_provider_id", "analysis_effort", "medium"),
 }
+ANSWER_MODES = {"GPT优先": "gpt", "Gemini/DeepSeek": "legacy"}
 QUOTA_CODES = {
     "credit_balance_exhausted",
     "insufficient_quota",
@@ -40,7 +41,7 @@ class ModelRouting:
         self.plugin = plugin
         self.config = plugin.config
         self.path = path
-        self.mode = "gpt"
+        self._mode = "gpt"
         self.reason = "default"
         self.gcp_patches = []
 
@@ -48,15 +49,32 @@ class ModelRouting:
     def enabled(self):
         return bool(self.config.get("model_routing_enabled", False))
 
+    @property
+    def mode(self):
+        selected = ANSWER_MODES.get(self.config.get("answer_mode"), self._mode)
+        if selected != self._mode:
+            self._mode, self.reason = selected, "settings"
+        return self._mode
+
     def load(self):
         if self.path.exists():
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if data.get("mode") not in ("gpt", "legacy"):
                 raise ValueError("invalid answer mode")
-            self.mode, self.reason = data["mode"], data.get("reason", "saved")
+            # A saved UI choice wins over the previous version's runtime cache.
+            selected = ANSWER_MODES.get(self.config.get("answer_mode"), data["mode"])
+            self._mode = selected
+            self.reason = (
+                data.get("reason", "saved") if selected == data["mode"] else "settings"
+            )
 
     def switch(self, mode, reason):
-        self.mode, self.reason = mode, reason
+        self.config["answer_mode"] = next(
+            label for label, value in ANSWER_MODES.items() if value == mode
+        )
+        self._mode, self.reason = mode, reason
+        if hasattr(self.config, "save_config"):
+            self.config.save_config()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_suffix(".tmp")
         temp.write_text(

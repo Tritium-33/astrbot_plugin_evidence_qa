@@ -11,6 +11,13 @@
     "type": "bool",
     "default": true
   },
+  "answer_mode": {
+    "description": "回答模式",
+    "type": "string",
+    "default": "GPT优先",
+    "options": ["GPT优先", "Gemini/DeepSeek"],
+    "hint": "直接在此切换并保存。GPT优先使用三项GPT回答；Gemini/DeepSeek使用备用分工。明确额度错误也会自动切换并保存本项，刷新配置页可见。恢复额度后在此选回GPT优先；辅助始终DeepSeek。模型分工总开关应保持开启。"
+  },
   "owner_ids": {
     "description": "私聊白名单",
     "hint": "填写允许私聊的用户ID，一行一个；也支持平台名:用户ID。空列表不开放QQ私聊。WebChat单独允许。",
