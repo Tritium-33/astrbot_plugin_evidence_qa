@@ -30,6 +30,7 @@ from .evidence import (
 )
 from .integration import SelectionBridge
 from .memory import MEMORY_STEPS, SKIP_MEMORY, MemoryBridge
+from .routing import ModelRouting
 
 STATE = "evidence_qa.state"
 
@@ -38,7 +39,11 @@ class BufferedChat(filter.CustomFilter):
     plugin = None
 
     def filter(self, event, cfg):
+        if self.plugin and self.plugin.routing.blocked(event):
+            event.stop_event()
+            return False
         if self.plugin and self.plugin.enabled(event):
+            self.plugin.routing.attach_gcp()
             media.collect(event)
             event.set_extra("enable_streaming", False)
         return False
@@ -62,6 +67,7 @@ class EvidenceQAPlugin(Star):
         folder = StarTools.get_data_dir("astrbot_plugin_evidence_qa")
         self.catalogue = Catalogue(folder / "catalogue.json")
         self.evidence_store = EvidenceStore(folder / "evidence.json")
+        self.routing = ModelRouting(self, folder / "routing.json")
         self.memory = MemoryBridge()
         self.selection = SelectionBridge(self)
         BufferedChat.plugin = self
@@ -70,12 +76,13 @@ class EvidenceQAPlugin(Star):
         from astrbot.core import astr_main_agent
         from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
 
-        for cache in (self.catalogue, self.evidence_store):
+        for cache in (self.catalogue, self.evidence_store, self.routing):
             try:
                 await asyncio.to_thread(cache.load)
             except (OSError, ValueError, TypeError):
                 logger.warning("[证据问答] 缓存读取失败：%s", cache.path.name)
         self.selection.install(astr_main_agent, internal)
+        self.routing.attach_gcp()
         logger.info(
             "[证据问答] AstrBot 4.29.3：接管%d个入口；目录仅加载缓存，更新请用 /资料目录更新。",
             len(self.selection.patches),
@@ -85,6 +92,7 @@ class EvidenceQAPlugin(Star):
         selected = getattr(event, "plugins_name", None)
         return (
             self.config.get("enabled", True)
+            and not self.routing.blocked(event)
             and (
                 event.get_message_type() == MessageType.FRIEND_MESSAGE
                 or (
@@ -96,9 +104,59 @@ class EvidenceQAPlugin(Star):
             and (selected is None or "astrbot_plugin_evidence_qa" in selected)
         )
 
-    @filter.custom_filter(BufferedChat, False, priority=100)
+    @filter.custom_filter(BufferedChat, False, priority=10000)
     async def buffer_reply(self, event: AstrMessageEvent):
         pass
+
+    @filter.command("回答模式")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def answer_mode(self, event: AstrMessageEvent, mode: str = "状态"):
+        if not self.routing.enabled:
+            yield event.plain_result("请先启用模型分工。")
+            return
+        choices = {"gpt": "gpt", "旧分工": "legacy", "legacy": "legacy"}
+        selected = choices.get(mode.lower())
+        if selected:
+            self.routing.switch(selected, "manual")
+        elif mode != "状态":
+            yield event.plain_result("用法：/回答模式 gpt、旧分工 或 状态")
+            return
+        yield event.plain_result(
+            f"回答模式：{self.routing.mode}；原因：{self.routing.reason}。辅助模型始终使用 DeepSeek。"
+        )
+
+    @filter.command("模型检查")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def check_models(self, event: AstrMessageEvent):
+        from .routing import GPT_ROLES
+
+        lines = [f"回答模式：{self.routing.mode}（{self.routing.reason}）"]
+        for label, key, effort in [
+            ("辅助", "worker_provider_id", None),
+            *(
+                (role, row[0], self.config.get(row[1], row[2]))
+                for role, row in GPT_ROLES.items()
+            ),
+            ("备用聊天", "legacy_chat_provider_id", None),
+            ("备用分析", "research_provider_id", None),
+            ("备用看图", "vision_provider_id", None),
+        ]:
+            identity = self.config.get(key, "").strip()
+            provider = self.context.get_provider_by_id(identity) if identity else None
+            detail = (
+                f"{identity} / {provider.get_model()}"
+                if provider
+                else "未配置或ID不存在"
+            )
+            lines.append(f"{label}：{detail}" + (f" / {effort}" if effort else ""))
+            if (
+                effort
+                and provider
+                and provider.provider_config.get("type") != "openai_responses"
+            ):
+                lines.append("  请将此模型的接口类型设为 OpenAI Responses。")
+        lines.append(f"GCP接管入口：{len(self.routing.gcp_patches)}；本检查不调用API。")
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("资料目录更新")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -117,6 +175,8 @@ class EvidenceQAPlugin(Star):
             yield event.plain_result("目录更新未完成，仍使用上次缓存；详细原因见日志。")
 
     async def provider_id(self, event):
+        if self.routing.enabled:
+            return self.routing.worker()
         return self.config.get(
             "worker_provider_id", ""
         ).strip() or await self.selected_provider_id(event)
@@ -274,10 +334,14 @@ class EvidenceQAPlugin(Star):
                 await media.resolve_quotes(event, config)
                 attachments = media.collect(event)
                 if attachments["refs"]:
-                    planner = await self.vision_provider_id(event)
-                    state["vision_provider"] = planner
                     image_urls = await media.prepare(event, config)
+                    if not self.routing.enabled:
+                        planner = await self.vision_provider_id(event)
+                        state["vision_provider"] = planner
             state["media"] = media.describe(attachments)
+            if self.routing.enabled:
+                state["original_images"] = attachments["refs"]
+                state["prepared_images"] = image_urls
             state["planner_provider"] = planner
             result = await self.ask(
                 planner,
@@ -292,11 +356,11 @@ class EvidenceQAPlugin(Star):
                     "chat_context": chat_context,
                 },
                 event,
-                image_urls=image_urls,
+                image_urls=[] if self.routing.enabled else image_urls,
             )
             plan = Plan.parse(result, question)
             observation = json_object(result).get("visual_context", "")
-            if image_urls and isinstance(observation, str):
+            if image_urls and isinstance(observation, str) and not self.routing.enabled:
                 state["visual_context"] = observation.strip()
             allowed = {d["kb_name"] for d in catalogue}
             plan.kb_names = [n for n in plan.kb_names if n in allowed]
@@ -308,7 +372,9 @@ class EvidenceQAPlugin(Star):
             state.update(plan=plan, provider=provider, status="planned")
             if plan.route == "catalogue":
                 state["catalogue"] = catalogue
-            if plan.route == "research":
+            if self.routing.enabled:
+                self.routing.select(state, event)
+            elif plan.route == "research":
                 target = self.config.get("research_provider_id", "").strip()
                 if target and not event.get_extra("selected_provider"):
                     event.set_extra("selected_provider", target)
@@ -320,7 +386,8 @@ class EvidenceQAPlugin(Star):
                 event.set_extra("selected_provider", planner)
             state["writer_provider"] = await self.selected_provider_id(event)
             state["describe_images_only"] = bool(
-                plan.route != "delegate"
+                not self.routing.enabled
+                and plan.route != "delegate"
                 and state.get("visual_context")
                 and state["writer_provider"] != state.get("vision_provider")
             )
@@ -342,18 +409,25 @@ class EvidenceQAPlugin(Star):
             # An image or emoji must not become silent merely because planning failed.
             if any(attachments[k] for k in ("refs", "quotes", "faces")):
                 state.update(
-                    plan=Plan("delegate", question),
+                    plan=Plan("chat" if self.routing.enabled else "delegate", question),
                     status="planned",
                     error=type(error).__name__,
                     visual_fallback=True,
                 )
+                if self.routing.enabled:
+                    try:
+                        self.routing.select(state, event)
+                    except ValueError:
+                        state.update(
+                            plan=Plan("unavailable", question), status="planning_failed"
+                        )
                 if state.get("vision_provider") and not event.get_extra(
                     "selected_provider"
                 ):
                     event.set_extra("selected_provider", state["vision_provider"])
                 event.set_extra(SKIP_MEMORY, False)
                 logger.warning(
-                    "[证据问答 %s] 图片规划失败，交给原生看图回复：%s",
+                    "[证据问答 %s] 图片规划失败，保留附件交给回答模型：%s",
                     state["trace_id"],
                     type(error).__name__,
                 )
@@ -466,7 +540,9 @@ class EvidenceQAPlugin(Star):
                     source_override="web",
                 )
             state["answer_mode"] = (
-                "local_technical" if self.needs_audit(plan, packet) else "direct"
+                "local_technical"
+                if self.needs_audit(plan, packet) and not state.get("gpt_answer")
+                else "direct"
             )
             rules = (
                 prompts.ANSWER_RULES
@@ -595,7 +671,7 @@ class EvidenceQAPlugin(Star):
             elif plan.route == "research":
                 packet = state.get("packet", Packet(plan.question))
                 if packet.sources:
-                    if self.needs_audit(plan, packet):
+                    if self.needs_audit(plan, packet) and not state.get("gpt_answer"):
                         state["answer_mode"] = "local_technical"
                         items, status = await focused_review(
                             lambda system, payload: self.ask(
@@ -766,6 +842,7 @@ class EvidenceQAPlugin(Star):
 
     async def terminate(self):
         self.selection.close()
+        self.routing.close()
         self.memory.close()
         if BufferedChat.plugin is self:
             BufferedChat.plugin = None

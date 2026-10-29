@@ -48,6 +48,9 @@ class SelectionBridge:
 
         @wraps(original)
         async def select(event, plugin_context):
+            if self.plugin.routing.blocked(event):
+                event.stop_event()
+                return None
             if self.managed(event) and plugin_context is self.plugin.context:
                 await self.plugin.plan_turn(event)
             return await original(event, plugin_context)
@@ -59,6 +62,7 @@ class SelectionBridge:
                 if hasattr(owner, "collect_initial_request"):
                     self._install_media(owner)
                 self._install_kb(owner)
+                self._install_helpers(owner)
                 self._install_runner(run_module)
             except Exception:
                 self.close()
@@ -110,6 +114,37 @@ class SelectionBridge:
 
         self._patch(owner, "_apply_kb", apply)
 
+    def _install_helpers(self, owner):
+        if hasattr(owner, "_get_compress_provider"):
+            original_compress = owner._get_compress_provider
+
+            @wraps(original_compress)
+            async def compress(config, context, event=None):
+                if (
+                    self.plugin.routing.enabled
+                    and context is self.plugin.context
+                    and (event is None or self.managed(event))
+                    and config.context_limit_reached_strategy == "llm_compress"
+                ):
+                    return self.plugin.routing.get_provider(
+                        self.plugin.routing.worker()
+                    )
+                return await original_compress(config, context, event)
+
+            self._patch(owner, "_get_compress_provider", compress)
+        if hasattr(owner, "_handle_webchat"):
+            original_title = owner._handle_webchat
+
+            @wraps(original_title)
+            async def title(event, request, provider):
+                if self.plugin.routing.enabled and self.managed(event):
+                    provider = self.plugin.routing.get_provider(
+                        self.plugin.routing.worker()
+                    )
+                return await original_title(event, request, provider)
+
+            self._patch(owner, "_handle_webchat", title)
+
     def _install_runner(self, owner):
         original = owner.run_agent
 
@@ -117,6 +152,20 @@ class SelectionBridge:
         async def run(runner, *args, **kwargs):
             event = runner.run_context.context.event
             state = event.get_extra(STATE)
+            if self.plugin.routing.blocked(event):
+                event.stop_event()
+                return
+            if (
+                self.managed(event)
+                and state
+                and self.plugin.routing.enabled
+                and state["plan"].route == "delegate"
+            ):
+                runner.provider = self.plugin.routing.get_provider(
+                    self.plugin.routing.worker()
+                )
+                runner.fallback_providers = []
+                runner.req.model = None
             if (
                 not self.managed(event)
                 or not state
@@ -140,6 +189,11 @@ class SelectionBridge:
                     async for chain in emit(event, runner.get_final_llm_resp()):
                         yield chain
                 return
+
+            if self.plugin.routing.enabled:
+                runner.provider = self.plugin.routing.answer_provider(state, event)
+                runner.fallback_providers = []
+                runner.req.model = None
 
             # Native lookup steps may yield intermediate text; only the final answer is sent.
             options = list(args)

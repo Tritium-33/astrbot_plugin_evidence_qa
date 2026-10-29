@@ -297,6 +297,11 @@ def render(items, missing, packet, *, citations=False):
                 lines.append(
                     "\n".join("> " + line for line in ref["quote"].splitlines())
                 )
+            elif s.get("channel") != "web" and s.get("content"):
+                lines.append("当时检索到的原文片段（未逐句核验支持关系）：")
+                lines.append(
+                    "\n".join("> " + line for line in s["content"].splitlines())
+                )
     return "\n\n".join(line for line in lines if line).strip()
 
 

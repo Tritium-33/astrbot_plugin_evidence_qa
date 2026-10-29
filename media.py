@@ -186,6 +186,20 @@ def chat_context(event):
 def apply_to_request(state, req):
     """Carry the visual observation to text models; keep pixels for the vision writer."""
     observation = state.get("visual_context")
+    if state.get("prepared_images"):
+        originals = state.get("original_images", [])
+        req.image_urls = unique_refs(
+            [
+                *(ref for ref in request_images(req) if ref not in originals),
+                *state["prepared_images"],
+            ]
+        )
+        req.extra_user_content_parts = [
+            p
+            for p in req.extra_user_content_parts
+            if not isinstance(p, ImageURLPart)
+            and not (isinstance(p, dict) and p.get("type") == "image_url")
+        ]
     if observation:
         text = "<visual_observation>\n" + observation + "\n</visual_observation>"
         if not any(

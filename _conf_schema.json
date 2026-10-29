@@ -1,58 +1,151 @@
 {
   "enabled": {
-    "description": "启用私聊、群聊及WebChat路由（不含Live；不主动唤醒消息）",
+    "type": "bool",
+    "default": true,
+    "hint": "启用私聊、群聊及WebChat路由（不含Live；不主动唤醒消息）",
+    "description": "启用插件"
+  },
+  "model_routing_enabled": {
+    "description": "模型分工",
+    "hint": "GPT只生成回答，辅助统一DeepSeek；关闭时回到v0.4的配置行为。",
     "type": "bool",
     "default": true
+  },
+  "owner_ids": {
+    "description": "私聊白名单",
+    "hint": "填写允许私聊的用户ID，一行一个；也支持平台名:用户ID。空列表不开放QQ私聊。WebChat单独允许。",
+    "type": "list",
+    "default": []
   },
   "worker_provider_id": {
-    "description": "任务规划、本地技术单次核验与目录概括的 Provider ID（建议 DeepSeek；留空用当前模型）",
     "type": "string",
-    "default": ""
+    "default": "",
+    "hint": "填写 DeepSeek Provider ID。负责规划、目录、压缩、标题和旧分工本地核验。",
+    "description": "辅助模型",
+    "_special": "select_provider"
+  },
+  "gpt_private_provider_id": {
+    "description": "私聊GPT",
+    "hint": "填写已配置的 OpenAI Responses Provider ID，不是模型名称或API Key。",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "private_effort": {
+    "description": "私聊思考",
+    "hint": "OpenAI官方 reasoning.effort，选项原样发送。Astra/Sol不支持none；Terra支持none。",
+    "type": "string",
+    "default": "low",
+    "options": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ]
+  },
+  "gpt_chat_provider_id": {
+    "description": "群聊GPT",
+    "hint": "填写已配置的 OpenAI Responses Provider ID，不是模型名称或API Key。",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "chat_effort": {
+    "description": "群聊思考",
+    "hint": "OpenAI官方 reasoning.effort，选项原样发送。Astra/Sol不支持none；Terra支持none。",
+    "type": "string",
+    "default": "low",
+    "options": [
+      "none",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ]
+  },
+  "gpt_analysis_provider_id": {
+    "description": "分析GPT",
+    "hint": "填写已配置的 OpenAI Responses Provider ID，不是模型名称或API Key。",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "analysis_effort": {
+    "description": "分析思考",
+    "hint": "OpenAI官方 reasoning.effort，选项原样发送。Astra/Sol不支持none；Terra支持none。",
+    "type": "string",
+    "default": "medium",
+    "options": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ]
+  },
+  "legacy_chat_provider_id": {
+    "description": "备用聊天",
+    "hint": "手动切回或OpenAI额度不可用后的聊天模型，填写Gemini Provider ID。",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
   },
   "research_provider_id": {
-    "description": "联网及本地资料回答的 Provider ID（留空保持当前模型，日常聊天不切换）",
     "type": "string",
-    "default": ""
+    "default": "",
+    "hint": "旧分工资料回答模型，填 DeepSeek Provider ID；留空沿用辅助模型。",
+    "description": "备用分析",
+    "_special": "select_provider"
+  },
+  "vision_provider_id": {
+    "_special": "select_provider",
+    "default": "",
+    "type": "string",
+    "hint": "旧分工看图回答模型，填支持图片的 Gemini Provider ID。",
+    "description": "备用看图"
+  },
+  "enable_group": {
+    "default": true,
+    "type": "bool",
+    "hint": "接管已被原生规则或Group Chat Plus触发的群聊回复",
+    "description": "启用群聊"
   },
   "isolate_research_memory": {
-    "description": "资料问答不进入 LivingMemory 总结输入（日常记忆保持，适配2.8.1/2.8.2私聊）",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "资料问答不进入 LivingMemory 总结输入（日常记忆保持，适配2.8.1/2.8.2私聊）",
+    "description": "资料记忆隔离"
   },
   "model_timeout_seconds": {
-    "description": "每次规划、本地技术核验及目录概括的超时秒数（大于0，原生回答另受提供商与整轮超时约束）",
     "type": "float",
-    "default": 90
+    "default": 90,
+    "hint": "每次规划、本地技术核验及目录概括的超时秒数（大于0，原生回答另受提供商与整轮超时约束）",
+    "description": "模型超时"
   },
   "retrieval_timeout_seconds": {
-    "description": "单次完整检索阶段的超时秒数，含选库、嵌入和重排（大于0）",
     "type": "float",
-    "default": 45
-  },
-  "turn_timeout_seconds": {
-    "description": "从规划到最终核验的预算秒数，不含排队与发送（大于0）",
-    "type": "float",
-    "default": 240
-  },
-  "save_traces": {
-    "description": "保存最近20次检索原文、候选输出、校验原因与最终答案，便于核查",
-    "type": "bool",
-    "default": true
+    "default": 45,
+    "hint": "单次完整检索阶段的超时秒数，含选库、嵌入和重排（大于0）",
+    "description": "检索超时"
   },
   "page_timeout_seconds": {
     "default": 15,
     "type": "float",
-    "description": "每个网页正文读取的超时秒数（大于0，且受检索总预算约束）"
+    "hint": "每个网页正文读取的超时秒数（大于0，且受检索总预算约束）",
+    "description": "网页超时"
   },
-  "enable_group": {
-    "description": "接管已被原生规则或Group Chat Plus触发的群聊回复",
+  "turn_timeout_seconds": {
+    "type": "float",
+    "default": 240,
+    "hint": "从规划到最终核验的预算秒数，不含排队与发送（大于0）",
+    "description": "整轮超时"
+  },
+  "save_traces": {
+    "type": "bool",
     "default": true,
-    "type": "bool"
-  },
-  "vision_provider_id": {
-    "description": "图片理解与看图聊天的Provider ID（填支持图片输入的Gemini等；留空用原生图片描述模型，再回退当前模型）",
-    "_special": "select_provider",
-    "default": "",
-    "type": "string"
+    "hint": "保存最近20次检索原文、候选输出、校验原因与最终答案，便于核查",
+    "description": "保存记录"
   }
 }
