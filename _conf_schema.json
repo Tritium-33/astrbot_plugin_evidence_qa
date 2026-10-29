@@ -19,10 +19,16 @@
     "hint": "直接在此切换并保存。GPT优先使用三项GPT回答；Gemini/DeepSeek使用备用分工。明确额度错误也会自动切换并保存本项，刷新配置页可见。恢复额度后在此选回GPT优先；辅助始终DeepSeek。模型分工总开关应保持开启。"
   },
   "owner_ids": {
-    "description": "私聊白名单",
-    "hint": "填写允许私聊的用户ID，一行一个；也支持平台名:用户ID。空列表不开放QQ私聊。WebChat单独允许。",
+    "description": "主人名单",
+    "hint": "允许私聊的用户ID，一行一个；也支持平台名:用户ID。开启群聊管控后，这些用户也是群聊管理者。WebChat单独允许。",
     "type": "list",
     "default": []
+  },
+  "group_owner_control": {
+    "description": "群聊管控",
+    "type": "bool",
+    "default": false,
+    "hint": "QQ群只允许主人名单执行注册命令和委托工具；其他人仍能对话、看图、查资料。主人可@后用自然语言要求暂停，或发 /群聊暂停；本群只回应主人，主人下次真实@或明确要求恢复后解除。暂停状态重启后保留。"
   },
   "worker_provider_id": {
     "type": "string",

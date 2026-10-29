@@ -101,6 +101,35 @@ class SelectionBridge:
 
         self._patch(stage, "_normalize_image_component", normalize)
 
+    def install_group_control(self, stage, event_class):
+        original_process = stage.process
+        original_send = event_class.send
+        control = self.plugin.group_control
+
+        @wraps(original_process)
+        async def process(stage_self, event):
+            if self.active:
+                receipt = control.admit(event)
+                if receipt:
+                    await event.send(event.plain_result(receipt))
+                    event.stop_event()
+                    return
+                if control.blocked(event):
+                    event.stop_event()
+                    return
+            async for part in original_process(stage_self, event):
+                yield part
+
+        @wraps(original_send)
+        async def send(event, message):
+            if self.active and control.blocked(event):
+                event.clear_result()
+                return
+            return await original_send(event, message)
+
+        self._patch(stage, "process", process)
+        self._patch(event_class, "send", send)
+
     def _install_media(self, owner):
         original = owner.collect_initial_request
 
@@ -209,6 +238,7 @@ class SelectionBridge:
                 "citation",
                 "catalogue",
                 "memory_control",
+                "group_control",
                 "unavailable",
             ):
                 await runner._complete_with_assistant_response(

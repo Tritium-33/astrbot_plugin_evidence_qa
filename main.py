@@ -28,6 +28,7 @@ from .evidence import (
     render,
     source_label,
 )
+from .group_control import GroupControl
 from .integration import SelectionBridge
 from .memory import MEMORY_STEPS, SKIP_MEMORY, MemoryBridge
 from .routing import ModelRouting
@@ -69,6 +70,7 @@ class EvidenceQAPlugin(Star):
         self.catalogue = Catalogue(folder / "catalogue.json")
         self.evidence_store = EvidenceStore(folder / "evidence.json")
         self.routing = ModelRouting(self, folder / "routing.json")
+        self.group_control = GroupControl(self, folder / "group_control.json")
         self.memory = MemoryBridge()
         self.selection = SelectionBridge(self)
         BufferedChat.plugin = self
@@ -77,14 +79,24 @@ class EvidenceQAPlugin(Star):
         from astrbot.core import astr_main_agent
         from astrbot.core.pipeline.preprocess_stage.stage import PreProcessStage
         from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
+        from astrbot.core.pipeline.process_stage.stage import ProcessStage
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+            AiocqhttpMessageEvent,
+        )
 
-        for cache in (self.catalogue, self.evidence_store, self.routing):
+        for cache in (
+            self.catalogue,
+            self.evidence_store,
+            self.routing,
+            self.group_control,
+        ):
             try:
                 await asyncio.to_thread(cache.load)
             except (OSError, ValueError, TypeError):
                 logger.warning("[证据问答] 缓存读取失败：%s", cache.path.name)
         self.selection.install(astr_main_agent, internal)
         self.selection.install_image_recovery(PreProcessStage)
+        self.selection.install_group_control(ProcessStage, AiocqhttpMessageEvent)
         self.routing.attach_gcp()
         logger.info(
             "[证据问答] AstrBot 4.29.3：接管%d个入口；目录仅加载缓存，更新请用 /资料目录更新。",
@@ -357,11 +369,20 @@ class EvidenceQAPlugin(Star):
                     "now": datetime.now().astimezone().isoformat(),
                     "media": state["media"],
                     "chat_context": chat_context,
+                    "group_control": self.group_control.planner_context(event),
                 },
                 event,
                 image_urls=[] if self.routing.enabled else image_urls,
             )
             plan = Plan.parse(result, question)
+            receipt = self.group_control.resolve(
+                event, json_object(result).get("group_action", "none")
+            )
+            if receipt:
+                plan = Plan("group_control", question)
+                state["group_receipt"] = receipt
+            if self.group_control.restricted(event) and plan.route == "delegate":
+                plan = Plan("chat", question)
             observation = json_object(result).get("visual_context", "")
             if image_urls and isinstance(observation, str) and not self.routing.enabled:
                 state["visual_context"] = observation.strip()
@@ -397,7 +418,8 @@ class EvidenceQAPlugin(Star):
             event.set_extra(
                 SKIP_MEMORY,
                 plan.exclude_memory
-                or plan.route in ("memory_control", "citation", "catalogue")
+                or plan.route
+                in ("memory_control", "citation", "catalogue", "group_control")
                 or (
                     plan.route == "research"
                     and self.config.get("isolate_research_memory", True)
@@ -671,6 +693,9 @@ class EvidenceQAPlugin(Star):
                 answer = self.citation_answer(state)
             elif plan.route == "memory_control":
                 answer = "这轮已请求跳过记忆记录，已有记忆没有改动。"
+            elif plan.route == "group_control":
+                answer = state["group_receipt"]
+                state["verification"] = "group_control_applied"
             elif plan.route == "research":
                 packet = state.get("packet", Packet(plan.question))
                 if packet.sources:
