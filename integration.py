@@ -1,8 +1,10 @@
-"""Reversible AstrBot 4.29.3 selection, KB and non-Live output adapters."""
+"""Reversible adapters for AstrBot 4.29.3; managed turns emit final text only."""
 
 import asyncio
 from functools import wraps
 
+from astrbot.api import logger
+from astrbot.api.provider import LLMResponse
 from astrbot.core.message.message_event_result import (
     MessageChain,
     MessageEventResult,
@@ -12,11 +14,30 @@ from astrbot.core.message.message_event_result import (
 STATE = "evidence_qa.state"
 
 
+async def emit(event, response):
+    if not response or not response.completion_text:
+        event.clear_result()
+        return
+    chain = MessageChain().message(response.completion_text)
+    event.set_result(
+        MessageEventResult(
+            chain=chain.chain, result_content_type=ResultContentType.LLM_RESULT
+        )
+    )
+    try:
+        yield chain
+    finally:
+        event.clear_result()
+
+
 class SelectionBridge:
     def __init__(self, plugin):
         self.plugin = plugin
         self.patches = []
         self.active = False
+
+    def managed(self, event):
+        return self.active and self.plugin.enabled(event)
 
     def install(self, owner, run_module=None):
         if self.active:
@@ -25,11 +46,7 @@ class SelectionBridge:
 
         @wraps(original)
         async def select(event, plugin_context):
-            if (
-                self.active
-                and plugin_context is self.plugin.context
-                and self.plugin.enabled(event)
-            ):
+            if self.managed(event) and plugin_context is self.plugin.context:
                 await self.plugin.plan_turn(event)
             return await original(event, plugin_context)
 
@@ -54,25 +71,17 @@ class SelectionBridge:
         async def apply(event, req, context, config):
             state = event.get_extra(STATE)
             if (
-                not (
-                    self.active
-                    and context is self.plugin.context
-                    and self.plugin.enabled(event)
-                    and state
-                )
-                or config.kb_agentic_mode
+                self.managed(event)
+                and context is self.plugin.context
+                and state
+                and state["plan"].route != "delegate"
             ):
-                return await original(event, req, context, config)
-            stage = {"status": "running"}
-            state["native_kb_stage"] = stage
-            try:
-                async with self.plugin.window(
-                    event, self.plugin.limits["retrieval_timeout_seconds"]
-                ):
-                    await original(event, req, context, config)
-                stage["status"] = "completed"
-            except TimeoutError:
-                stage.update(status="timeout", error="TimeoutError")
+                state["native_kb_stage"] = {
+                    "status": "skipped",
+                    "reason": "managed_routing",
+                }
+                return
+            return await original(event, req, context, config)
 
         self._patch(owner, "_apply_kb", apply)
 
@@ -82,80 +91,78 @@ class SelectionBridge:
         @wraps(original)
         async def run(runner, *args, **kwargs):
             event = runner.run_context.context.event
-            if not self.active or not self.plugin.enabled(event):
+            state = event.get_extra(STATE)
+            if not self.managed(event) or (state and state["plan"].route == "delegate"):
                 async for part in original(runner, *args, **kwargs):
                     yield part
                 return
-            state = event.get_extra(STATE)
-            runner.streaming = (
-                False  # Actual provider execution, before its first step.
-            )
+            runner.streaming = False
             if state:
-                state["streaming"] = runner.streaming
+                state["streaming"] = False
+            if state and state["plan"].route in (
+                "citation",
+                "memory_control",
+                "unavailable",
+            ):
+                await runner._complete_with_assistant_response(
+                    LLMResponse(role="assistant", completion_text="")
+                )
+                if state.get("status") == "finished":
+                    async for chain in emit(event, runner.get_final_llm_resp()):
+                        yield chain
+                return
+
             iterator = original(runner, *args, **kwargs)
+            reason = None
             try:
-                while True:
-                    reason = None
-                    try:
-                        if state is None:
-                            reason = "planning_not_observed"
-                        else:
-                            finished = state.get("status") == "finished"
-                            async with (
-                                asyncio.timeout(None)
-                                if finished
-                                else self.plugin.window(
-                                    event, self.plugin.limits["turn_timeout_seconds"]
-                                )
-                            ):
-                                part = await anext(iterator)
-                    except StopAsyncIteration:
-                        if (
-                            event.is_stopped()
-                            or event.get_extra("agent_user_aborted")
-                            or event.get_extra("agent_stop_requested")
-                        ):
-                            return
-                        if (
-                            state
-                            and state["plan"].route != "chat"
-                            and state.get("status") != "finished"
-                        ):
-                            reason = "runner_incomplete"
-                        else:
-                            return
-                    except TimeoutError:
-                        reason = "turn_timeout"
-
-                    guarded = state is None or state["plan"].route != "chat"
-                    if guarded and not reason and state.get("status") != "finished":
-                        reason = "unverified_output"
-                    if reason:
-                        await iterator.aclose()
-                        response = await self.plugin.finish_interrupted(
-                            event, runner, reason
-                        )
-                    elif guarded:
-                        response = runner.get_final_llm_resp()
+                try:
+                    if state is None:
+                        reason = "planning_not_observed"
                     else:
-                        yield part
-                        continue
-
-                    # Only the final, reconciled text is passed to the send pipeline.
-                    chain = MessageChain().message(response.completion_text)
-                    event.set_result(
-                        MessageEventResult(
-                            chain=chain.chain,
-                            result_content_type=ResultContentType.LLM_RESULT,
-                        )
+                        async with self.plugin.window(
+                            event, self.plugin.limits["turn_timeout_seconds"]
+                        ):
+                            await anext(iterator)
+                        if state.get("status") != "finished":
+                            reason = "unverified_output"
+                except StopAsyncIteration:
+                    if (
+                        event.is_stopped()
+                        or event.get_extra("agent_user_aborted")
+                        or event.get_extra("agent_stop_requested")
+                    ):
+                        return
+                    if state and state.get("status") == "finished":
+                        return
+                    reason = "runner_incomplete"
+                except TimeoutError:
+                    reason = "turn_timeout"
+                except Exception as error:  # noqa: BLE001 - native runner boundary
+                    reason = "runner_error:" + type(error).__name__
+                if reason:
+                    response = await self.plugin.finish_interrupted(
+                        event, runner, reason
                     )
+                else:
+                    response = runner.get_final_llm_resp()
+                async for chain in emit(event, response):
                     yield chain
-                    event.clear_result()
-                    async for _ in iterator:
-                        pass  # Let the native generator finish its stop-watcher cleanup.
-                    return
+                # Cleanup may log an error, but must not undo or append to an emitted answer.
+                try:
+                    async with asyncio.timeout(2):
+                        async for _ in iterator:
+                            pass
+                except Exception as error:  # noqa: BLE001 - native generator cleanup
+                    logger.warning(
+                        "[证据问答] 输出后的清理异常：%s", type(error).__name__
+                    )
             finally:
-                await iterator.aclose()
+                try:
+                    await iterator.aclose()
+                except Exception as error:  # noqa: BLE001 - native generator cleanup
+                    logger.warning(
+                        "[证据问答] 关闭生成器异常：%s", type(error).__name__
+                    )
 
         self._patch(owner, "run_agent", run)
 

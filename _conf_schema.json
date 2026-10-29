@@ -1,10 +1,47 @@
 {
-  "enabled": {"description": "启用私聊证据问答", "type": "bool", "default": true},
-  "worker_provider_id": {"description": "任务规划与语义审查模型的 Provider ID（建议 DeepSeek；留空用当前模型）", "type": "string", "default": ""},
-  "research_provider_id": {"description": "技术问答本轮使用的 Provider ID（留空保持当前模型，日常聊天不切换）", "type": "string", "default": ""},
-  "isolate_research_memory": {"description": "技术问答不进入 LivingMemory 总结输入（日常记忆保持，适配2.8.1私聊）", "type": "bool", "default": true},
-  "model_timeout_seconds": {"description": "每次规划、整理或审查的超时秒数（大于0）", "type": "float", "default": 90},
-  "retrieval_timeout_seconds": {"description": "单次完整检索阶段的超时秒数，含选库、嵌入和重排（大于0）", "type": "float", "default": 45},
-  "turn_timeout_seconds": {"description": "从锁内规划开始的问答预算秒数；覆盖原生知识库、草稿与复核，不含排队和发送（大于0）", "type": "float", "default": 240},
-  "save_traces": {"description": "在插件数据目录保存最近20次检索原文与最终答案，便于核查", "type": "bool", "default": true}
+  "enabled": {
+    "description": "启用私聊路由与证据问答（含WebChat，不含Live）",
+    "type": "bool",
+    "default": true
+  },
+  "worker_provider_id": {
+    "description": "任务规划与语义审查模型的 Provider ID（建议 DeepSeek；留空用当前模型）",
+    "type": "string",
+    "default": ""
+  },
+  "research_provider_id": {
+    "description": "技术问答本轮使用的 Provider ID（留空保持当前模型，日常聊天不切换）",
+    "type": "string",
+    "default": ""
+  },
+  "isolate_research_memory": {
+    "description": "技术问答不进入 LivingMemory 总结输入（日常记忆保持，适配2.8.1私聊）",
+    "type": "bool",
+    "default": true
+  },
+  "model_timeout_seconds": {
+    "description": "每次规划、审查、修正或短聊压缩的超时秒数（大于0）",
+    "type": "float",
+    "default": 90
+  },
+  "retrieval_timeout_seconds": {
+    "description": "单次完整检索阶段的超时秒数，含选库、嵌入和重排（大于0）",
+    "type": "float",
+    "default": 45
+  },
+  "turn_timeout_seconds": {
+    "description": "从规划到最终核验的预算秒数，不含排队与发送（大于0）",
+    "type": "float",
+    "default": 240
+  },
+  "save_traces": {
+    "description": "在插件数据目录保存最近20次检索原文与最终答案，便于核查",
+    "type": "bool",
+    "default": true
+  },
+  "page_timeout_seconds": {
+    "default": 15,
+    "type": "float",
+    "description": "每个网页正文读取的超时秒数（大于0，且受检索总预算约束）"
+  }
 }

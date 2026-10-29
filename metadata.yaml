@@ -1,7 +1,7 @@
 name: astrbot_plugin_evidence_qa
-display_name: 文献证据问答
-desc: 私聊任务规划、原生知识库分项检索、引文核对与LivingMemory隔离
-version: v0.1.1
+display_name: 证据问答与会话路由
+desc: 私聊联网与本地资料路由、按需来源、简短闲聊及LivingMemory隔离
+version: v0.2.0
 author: Tritium-33
 repo: https://github.com/Tritium-33/astrbot_plugin_evidence_qa
 astrbot_version: '==4.29.3'

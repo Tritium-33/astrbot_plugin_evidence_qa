@@ -62,12 +62,18 @@ class Plan:
     question: str
     queries: list[str] = field(default_factory=list)
     exclude_memory: bool = False
+    source: str = "web"
+    kb_names: list[str] = field(default_factory=list)
+    reference: str = ""
+    item_ids: list[int] = field(default_factory=list)
+    detailed: bool = False
+    local_only: bool = False
 
     @classmethod
     def parse(cls, raw, original):
         data = json_object(raw)
         route = data.get("route")
-        if route not in ("chat", "research", "memory_control"):
+        if route not in ("chat", "research", "citation", "memory_control", "delegate"):
             raise ValueError("Invalid task route")
         question = data.get("question")
         if not isinstance(question, str) or not question.strip():
@@ -75,7 +81,23 @@ class Plan:
         queries = strings(data.get("queries"), 4)
         if route == "research" and not queries:
             queries = [question]
-        return cls(route, question.strip(), queries, data.get("exclude_memory") is True)
+        source = data.get("source", "web")
+        if source not in ("web", "kb", "both"):
+            source = "web"
+        return cls(
+            route,
+            question.strip(),
+            queries,
+            data.get("exclude_memory") is True,
+            source,
+            strings(data.get("kb_names"), 20),
+            str(data.get("reference") or ""),
+            [i for i in data.get("item_ids", []) if type(i) is int and i >= 0]
+            if isinstance(data.get("item_ids"), list)
+            else [],
+            data.get("detailed") is True,
+            data.get("local_only") is True,
+        )
 
 
 @dataclass
@@ -95,8 +117,8 @@ class Packet:
         rows = list(result.get("results", [])) + list(
             result.get("equipment_context", [])
         )
-        keys = ("kb_id", "doc_id", "chunk_id", "content")
-        seen = {tuple(s[k] for k in keys) for s in self.sources}
+        keys = ("kb_id", "doc_id", "chunk_id", "url", "content")
+        seen = {tuple(s.get(k, "") for k in keys) for s in self.sources}
         for row in rows:
             if not isinstance(row.get("content"), str):
                 self.errors.append("invalid_source_content")
@@ -125,6 +147,13 @@ class Packet:
 
 
 def validate_items(data, packet):
+    if not isinstance(packet.sources, list) or any(
+        not isinstance(s, dict)
+        or not isinstance(s.get("id"), str)
+        or not isinstance(s.get("content"), str)
+        for s in packet.sources
+    ):
+        raise TypeError("Invalid evidence sources")
     sources = {s["id"]: s for s in packet.sources}
     items = data.get("items")
     if not isinstance(items, list) or len(items) > 12:
@@ -154,6 +183,9 @@ def validate_items(data, packet):
 
 
 def source_label(source, packet):
+    if source.get("url"):
+        kind = "网页正文" if source.get("content_kind") == "page_text" else "搜索摘要"
+        return f"{source.get('title') or source['url']} — {source['url']}（{kind}，抓取时间 {source.get('retrieved_at', '')}）"
     label = source["doc_name"] or source["doc_id"]
     if source["kb_name"]:
         label = source["kb_name"] + " / " + label
@@ -175,46 +207,29 @@ def source_label(source, packet):
     return label
 
 
-def render(items, missing, packet):
+def render(items, missing, packet, *, citations=False):
     sources = {s["id"]: s for s in packet.sources}
     lines = []
     for item in items:
         lines.append(item["text"].strip())
-        for ref in item["evidence"]:
+        for ref in item["evidence"] if citations else []:
             s = sources[ref["source"]]
             lines.append(f"出处：{source_label(s, packet)}。")
             lines.append("\n".join("> " + line for line in ref["quote"].splitlines()))
-    if missing:
-        lines.append("本次返回片段尚未覆盖：" + "；".join(missing) + "。")
     return "\n\n".join(line for line in lines if line).strip()
 
 
-def excerpt_fallback(packet):
-    if not packet.sources:
-        return "本次知识库检索没有取得可引用的片段，尚不能回答这项资料问题。"
-    lines = ["本次未能完成可靠的答案整理，先列出实际返回的原文："]
-    for source in packet.sources[:3]:
-        lines.append(f"{source_label(source, packet)}：")
-        lines.append("\n".join("> " + line for line in source["content"].splitlines()))
-    return "\n\n".join(lines)
-
-
 async def review(ask, retrieve, packet, draft):
-    """Up to two review/audit passes, with at most two extra native searches."""
+    """Validate the native structured answer; repair only on a failed audit."""
     last_error = ""
+    approved = []
+    extra_queries = 0
     for attempt in range(2):
-        payload = {**packet.payload(), "draft": draft, "format_error": last_error}
         try:
-            data = json_object(await ask(prompts.REVIEW, payload))
+            data = json_object(draft)
             items = validate_items(data, packet)
             missing = strings(data.get("missing"), 12)
-            queries = [
-                q for q in strings(data.get("queries"), 2) if q not in packet.queries
-            ]
-            if attempt == 0 and missing and queries:
-                for query in queries:
-                    await retrieve(query, packet)
-                continue
+            queries = strings(data.get("queries"), 2)
             if items:
                 audit = json_object(
                     await ask(
@@ -226,17 +241,42 @@ async def review(ask, retrieve, packet, draft):
                     audit.get(k) is True
                     for k in ("supported", "complete", "process_ok")
                 ):
-                    return render(items, missing, packet), "model_audited"
+                    return items, "model_audited"
+                if audit.get("process_ok") is True:
+                    indices = audit.get("accepted", [])
+                    if isinstance(indices, list):
+                        approved = [
+                            items[i]
+                            for i in indices
+                            if type(i) is int and 0 <= i < len(items)
+                        ]
                 last_error = (
                     "; ".join(strings(audit.get("issues"), 12))
                     or "Evidence audit failed."
                 )
-                if attempt == 0:
-                    for query in strings(audit.get("queries"), 2):
-                        if query not in packet.queries:
-                            await retrieve(query, packet)
-                continue
-            last_error = "No supported items; extract the relevant original sentences."
+                queries = strings(audit.get("queries"), 2) or queries
+            else:
+                last_error = (
+                    "No supported items. Do not infer a whole book lacks information."
+                )
         except (ValueError, TypeError) as error:
             last_error = str(error)
-    return excerpt_fallback(packet), "excerpts"
+            queries = []
+        if attempt == 0:
+            try:
+                for query in queries:
+                    if query not in packet.queries and extra_queries < 2:
+                        await retrieve(query, packet)
+                        extra_queries += 1
+                draft = await ask(
+                    prompts.REPAIR,
+                    {
+                        **packet.payload(),
+                        "draft": draft,
+                        "issues": last_error,
+                    },
+                )
+            except Exception as error:  # noqa: BLE001 - provider boundary
+                packet.errors.append(type(error).__name__)
+                break
+    return approved, "partial_audited" if approved else "silent_unverified"
