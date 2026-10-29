@@ -3,9 +3,9 @@
 import asyncio
 from datetime import datetime
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .evidence import json_object
+from .evidence import diagnostic, json_object
 
 PROVIDERS = {
     "deepseek": "DeepSeekWebSearchTool",
@@ -38,6 +38,51 @@ def is_url(value):
         )
     except ValueError:
         return False
+
+
+def page_identity(url):
+    """Group tracking/locale variants, preserving actual article query parameters."""
+    parts = urlsplit(url)
+    query = [
+        (k, v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if not k.lower().startswith("utm_")
+        and k.lower() not in ("hl", "lang", "locale", "authuser", "icid")
+    ]
+    return urlunsplit(
+        (parts.scheme, parts.netloc.lower(), parts.path, urlencode(sorted(query)), "")
+    )
+
+
+def reading_order(rows, query):
+    """Prefer readable, distinct pages; never spend all reads on locale duplicates."""
+    chinese = any("\u4e00" <= c <= "\u9fff" for c in query)
+
+    def rank(row):
+        title = row["title"]
+        locale = dict(parse_qsl(urlsplit(row["url"]).query)).get("hl", "")
+        readable = any("\u4e00" <= c <= "\u9fff" for c in title) if chinese else False
+        latin = sum(c.isascii() and c.isalpha() for c in title) > len(title) / 3
+        return (
+            not (readable or latin),
+            bool(locale and not locale.startswith(("zh", "en"))),
+        )
+
+    candidates = sorted(rows, key=rank)
+    selected, seen_pages, domains = [], set(), set()
+    repeated_domains = []
+    for row in candidates:
+        identity = page_identity(row["url"])
+        if identity in seen_pages:
+            continue
+        seen_pages.add(identity)
+        domain = urlsplit(row["url"]).hostname
+        if domain in domains:
+            repeated_domains.append(row)
+        else:
+            selected.append(row)
+            domains.add(domain)
+    return selected + repeated_domains
 
 
 async def search(context, event, query, page_timeout=15):
@@ -91,7 +136,11 @@ async def search(context, event, query, page_timeout=15):
                 fetch_status="completed",
             )
         except Exception as error:  # noqa: BLE001 - native tool boundary
-            row.update(fetch_status="failed", fetch_error=type(error).__name__)
+            row.update(
+                fetch_status="failed",
+                fetch_error=type(error).__name__,
+                fetch_detail=diagnostic(error, 600),
+            )
         row["fetch_seconds"] = round(asyncio.get_running_loop().time() - started, 3)
         return row
 
@@ -99,11 +148,11 @@ async def search(context, event, query, page_timeout=15):
         return {"results": [await read(source(query))]}
     arguments = {"query": query}
     if provider == "deepseek":
-        arguments.update(count=5, need_content=False)
+        arguments.update(count=8, need_content=False)
         if len(query) > 128:
             raise ValueError("web_query_exceeds_128_characters")
     elif provider == "tavily":
-        arguments.update(max_results=5, search_depth="advanced")
+        arguments.update(max_results=8, search_depth="advanced")
     raw = await tool.call(wrapper, **arguments)
     data = json_object(raw)
     rows = []
@@ -127,6 +176,13 @@ async def search(context, event, query, page_timeout=15):
             source(result["url"], result.get("title"), content, "search_snippet")
         )
         by_url[result["url"]] = rows[-1]
-    # Independent full-page reads run concurrently, without a second model call.
-    rows[:2] = await asyncio.gather(*(read(row) for row in rows[:2]))
+    # At most four distinct page attempts, aiming for two successful reads.
+    # Failed reads retain snippets and leave room to try other results.
+    rows = reading_order(rows, query)
+    candidates = rows[:4]
+    successes = 0
+    while candidates and successes < 2 and provider in READERS:
+        batch, candidates = candidates[: 2 - successes], candidates[2 - successes :]
+        fetched = await asyncio.gather(*(read(row) for row in batch))
+        successes += sum(row.get("fetch_status") == "completed" for row in fetched)
     return {"results": rows}

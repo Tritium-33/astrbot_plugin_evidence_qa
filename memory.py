@@ -1,4 +1,4 @@
-"""Reversible adapter for LivingMemory 2.8.1 private-chat event entry points."""
+"""Reversible adapter for LivingMemory 2.8.1/2.8.2 private-chat entry points."""
 
 from functools import wraps
 
@@ -17,7 +17,7 @@ class MemoryBridge:
             if (
                 meta.name != "astrbot_plugin_livingmemory"
                 or not meta.activated
-                or str(meta.version).lstrip("v") != "2.8.1"
+                or str(meta.version).lstrip("v") not in ("2.8.1", "2.8.2")
             ):
                 continue
             owner = getattr(meta.star_cls, "event_handler", None)

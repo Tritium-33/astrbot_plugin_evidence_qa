@@ -17,7 +17,16 @@ from astrbot.core.agent.message import TextPart
 
 from . import prompts, web
 from .catalogue import Catalogue, EvidenceStore
-from .evidence import Packet, Plan, history_text, render, review
+from .evidence import (
+    Packet,
+    Plan,
+    diagnostic,
+    history_text,
+    json_object,
+    render,
+    review,
+    strings,
+)
 from .integration import SelectionBridge
 from .memory import MEMORY_STEPS, SKIP_MEMORY, MemoryBridge
 
@@ -157,7 +166,7 @@ class EvidenceQAPlugin(Star):
                 phase = next(
                     (
                         name.lower()
-                        for name in ("PLAN", "AUDIT", "REPAIR", "SHORTEN")
+                        for name in ("PLAN", "AUDIT", "REPAIR", "FOLLOWUP", "SHORTEN")
                         if system == getattr(prompts, name)
                     ),
                     "model",
@@ -288,6 +297,8 @@ class EvidenceQAPlugin(Star):
             if source_override
             else (("kb", "web") if plan.source == "both" else (plan.source,))
         )
+        if web.is_url(query) and not plan.local_only:
+            channels = ("web",)
         for channel in channels:
             if len(packet.operations) >= 6:
                 return
@@ -320,7 +331,11 @@ class EvidenceQAPlugin(Star):
                     operation["status"] = "completed"
             except Exception as error:  # noqa: BLE001 - native/provider boundary
                 packet.errors.append(type(error).__name__)
-                operation.update(status="failed", error=type(error).__name__)
+                operation.update(
+                    status="failed",
+                    error=type(error).__name__,
+                    detail=diagnostic(error, 600),
+                )
             finally:
                 operation["seconds"] = round(
                     asyncio.get_running_loop().time() - start, 3
@@ -420,7 +435,13 @@ class EvidenceQAPlugin(Star):
                 answer = "这轮已请求跳过记忆记录，已有记忆没有改动。"
             elif plan.route == "research":
                 packet = state.get("packet", Packet(plan.question))
-                if packet.sources:
+                try:
+                    followups = strings(
+                        json_object(resp.completion_text).get("queries"), 2
+                    )
+                except (ValueError, TypeError):
+                    followups = []
+                if packet.sources or followups:
                     items, status = await review(
                         lambda system, payload: self.ask(
                             state["provider"]
@@ -436,6 +457,16 @@ class EvidenceQAPlugin(Star):
                     )
                     state.update(items=items, verification=status)
                     answer = render(items, [], packet)
+                    if not answer:
+                        logger.warning(
+                            "[证据问答 %s] 无可发送答案：%s；各轮校验=%s",
+                            state["trace_id"],
+                            status,
+                            diagnostic(
+                                [step.get("issues", []) for step in packet.diagnostics],
+                                1000,
+                            ),
+                        )
                 else:
                     state["verification"] = "silent_no_sources"
         except Exception as error:  # noqa: BLE001 - native/provider boundary
@@ -542,6 +573,7 @@ class EvidenceQAPlugin(Star):
             "plan": asdict(state["plan"]),
             "timeouts": self.limits,
             **packet.payload(),
+            "validation": packet.diagnostics,
             "answer": answer,
         }
         (folder / (state["trace_id"] + ".json")).write_text(

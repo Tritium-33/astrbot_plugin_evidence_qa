@@ -39,13 +39,37 @@ def history_text(history, count=6):
 
 
 def json_object(raw):
+    if not isinstance(raw, str):
+        raise TypeError("Expected JSON text")
     raw = raw.strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
-    value = json.loads(raw)
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        # Some providers wrap a single JSON object in a short explanation.
+        start = raw.find("{")
+        if start < 0:
+            raise
+        value, end = json.JSONDecoder().raw_decode(raw[start:])
+        if "{" in raw[start + end :]:
+            raise ValueError("Multiple JSON objects") from None
     if not isinstance(value, dict):
         raise TypeError("Expected a JSON object")
     return value
+
+
+def diagnostic(value, limit=16000):
+    """Bound diagnostic text and remove common credential representations."""
+    text = str(value)
+    text = re.sub(r"(?i)bearer\s+[^\s\"',}]+", "Bearer [REDACTED]", text)
+    text = re.sub(
+        r"(?i)((?:api[_-]?key|access_token|authorization|token)[\"']?\s*[:=]\s*[\"']?)[^\s\"'&,}]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}", "[REDACTED]", text)
+    return text[:limit]
 
 
 def strings(value, limit):
@@ -108,6 +132,7 @@ class Packet:
     queries: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     operations: list[dict] = field(default_factory=list)
+    diagnostics: list[dict] = field(default_factory=list)
 
     def add(self, query, result, *, record_query=True):
         if record_query:
@@ -146,7 +171,7 @@ class Packet:
         }
 
 
-def validate_items(data, packet):
+def validate_items(data, packet, *, strict=True, issues=None):
     if not isinstance(packet.sources, list) or any(
         not isinstance(s, dict)
         or not isinstance(s.get("id"), str)
@@ -156,30 +181,68 @@ def validate_items(data, packet):
         raise TypeError("Invalid evidence sources")
     sources = {s["id"]: s for s in packet.sources}
     items = data.get("items")
-    if not isinstance(items, list) or len(items) > 12:
-        raise ValueError("Invalid evidence items")
+    if not isinstance(items, list):
+        raise TypeError("Invalid evidence items")
     clean = []
-    for item in items:
-        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
-            raise TypeError("Invalid claim")
-        refs = item.get("evidence")
-        if (
-            not item["text"].strip()
-            or not isinstance(refs, list)
-            or not 1 <= len(refs) <= 3
-        ):
-            raise ValueError("Claim needs evidence")
-        for ref in refs:
-            if not isinstance(ref, dict):
-                raise TypeError("Invalid reference")
-            source = sources.get(ref.get("source"))
-            quote = ref.get("quote")
-            if source is None or not isinstance(quote, str) or not quote.strip():
-                raise ValueError("Unknown source or empty quote")
-            if quote not in source["content"]:
-                raise ValueError("Quote is not verbatim")
-        clean.append(item)
+    issues = issues if issues is not None else []
+    if len(items) > 12:
+        if strict:
+            raise ValueError("Too many evidence items")
+        issues.append(
+            "Only the first 12 items are processed; combine overlapping points."
+        )
+    for index, item in enumerate(items[:12]):
+        try:
+            clean.append(
+                validate_item(item, sources, strict=strict, issues=issues, index=index)
+            )
+        except (ValueError, TypeError) as error:
+            if strict:
+                raise
+            issues.append(f"item[{index}]: {error}")
     return clean
+
+
+def validate_item(item, sources, *, strict, issues, index):
+    if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+        raise TypeError("Invalid claim")
+    refs = item.get("evidence")
+    if (
+        not item["text"].strip()
+        or not isinstance(refs, list)
+        or not 1 <= len(refs) <= 3
+    ):
+        raise ValueError("Claim needs evidence")
+    clean_refs = []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            raise TypeError("Invalid reference")
+        source = sources.get(ref.get("source"))
+        quote = ref.get("quote")
+        if source is None:
+            raise ValueError("Unknown source")
+        citation = {"source": ref["source"]}
+        if isinstance(quote, str) and quote.strip():
+            if quote not in source["content"]:
+                # Restore original whitespace, without changing words, digits or units.
+                pattern = r"\s+".join(re.escape(part) for part in quote.split())
+                match = re.search(pattern, source["content"])
+                quote = match.group() if match else None
+            if quote:
+                citation["quote"] = quote
+        if "quote" not in citation:
+            if source.get("channel") != "web":
+                raise ValueError("Local quote is empty or not verbatim")
+            if ref.get("quote"):
+                if strict:
+                    raise ValueError("Quote is not verbatim")
+                issues.append(
+                    f"item[{index}]: unverified web quotation removed; audit source support"
+                )
+            # Web claims cite a retrieved source, just as a search tool response does.
+            # Semantic support is still checked by AUDIT; never render an invented quote.
+        clean_refs.append(citation)
+    return {"text": item["text"].strip(), "evidence": clean_refs}
 
 
 def source_label(source, packet):
@@ -215,34 +278,54 @@ def render(items, missing, packet, *, citations=False):
         for ref in item["evidence"] if citations else []:
             s = sources[ref["source"]]
             lines.append(f"出处：{source_label(s, packet)}。")
-            lines.append("\n".join("> " + line for line in ref["quote"].splitlines()))
+            if ref.get("quote"):
+                lines.append(
+                    "\n".join("> " + line for line in ref["quote"].splitlines())
+                )
     return "\n\n".join(line for line in lines if line).strip()
 
 
 async def review(ask, retrieve, packet, draft):
-    """Validate the native structured answer; repair only on a failed audit."""
-    last_error = ""
+    """Keep supported items and allow bounded search/read follow-ups or one repair."""
     approved = []
     extra_queries = 0
-    for attempt in range(2):
+    repaired = False
+    for attempt in range(3):
+        step = {
+            "attempt": attempt + 1,
+            "output": diagnostic(draft),
+            "output_chars": len(str(draft)),
+            "output_truncated": len(str(draft)) > 16000,
+            "issues": [],
+        }
+        packet.diagnostics.append(step)
+        queries = []
         try:
             data = json_object(draft)
-            items = validate_items(data, packet)
             missing = strings(data.get("missing"), 12)
             queries = strings(data.get("queries"), 2)
+            items = validate_items(data, packet, strict=False, issues=step["issues"])
+            step["valid_items"] = len(items)
             if items:
-                audit = json_object(
-                    await ask(
-                        prompts.AUDIT,
-                        {**packet.payload(), "items": items, "missing": missing},
-                    )
+                audit_text = await ask(
+                    prompts.AUDIT,
+                    {**packet.payload(), "items": items, "missing": missing},
                 )
+                step["audit_output"] = diagnostic(audit_text)
+                audit = json_object(audit_text)
+                step["audit"] = audit
+                step.pop("audit_output")
                 if all(
                     audit.get(k) is True
                     for k in ("supported", "complete", "process_ok")
                 ):
-                    return items, "model_audited"
-                if audit.get("process_ok") is True:
+                    if not step["issues"]:
+                        return items, "model_audited"
+                    # Other malformed items do not invalidate these individually audited items.
+                    approved = items
+                    if not missing and not queries:
+                        return approved, "partial_audited"
+                elif audit.get("process_ok") is True:
                     indices = audit.get("accepted", [])
                     if isinstance(indices, list):
                         approved = [
@@ -250,33 +333,44 @@ async def review(ask, retrieve, packet, draft):
                             for i in indices
                             if type(i) is int and 0 <= i < len(items)
                         ]
-                last_error = (
-                    "; ".join(strings(audit.get("issues"), 12))
-                    or "Evidence audit failed."
-                )
+                else:
+                    approved = []
+                step["issues"].extend(strings(audit.get("issues"), 12))
                 queries = strings(audit.get("queries"), 2) or queries
             else:
-                last_error = (
-                    "No supported items. Do not infer a whole book lacks information."
+                step["issues"].append(
+                    "No supported items; use the available sources or search/read further."
                 )
         except (ValueError, TypeError) as error:
-            last_error = str(error)
-            queries = []
-        if attempt == 0:
-            try:
-                for query in queries:
-                    if query not in packet.queries and extra_queries < 2:
-                        await retrieve(query, packet)
-                        extra_queries += 1
-                draft = await ask(
-                    prompts.REPAIR,
-                    {
-                        **packet.payload(),
-                        "draft": draft,
-                        "issues": last_error,
-                    },
-                )
-            except Exception as error:  # noqa: BLE001 - provider boundary
-                packet.errors.append(type(error).__name__)
-                break
+            step["issues"].append(diagnostic(error, 600))
+        except Exception as error:  # noqa: BLE001 - audit provider boundary
+            step["error"] = diagnostic(error, 600)
+            packet.errors.append(type(error).__name__)
+            break
+        if attempt == 2:
+            break
+        followups = [q for q in queries if q not in packet.queries][: 2 - extra_queries]
+        if not followups and repaired:
+            break
+        if not followups:
+            repaired = True
+        try:
+            for query in followups:
+                await retrieve(query, packet)
+                extra_queries += 1
+            system = prompts.FOLLOWUP if followups else prompts.REPAIR
+            draft = await ask(
+                system,
+                {
+                    **packet.payload(),
+                    "draft": draft,
+                    "accepted_items": approved,
+                    "issues": step["issues"],
+                    "remaining_followups": 2 - extra_queries,
+                },
+            )
+        except Exception as error:  # noqa: BLE001 - provider boundary
+            step["error"] = diagnostic(error, 600)
+            packet.errors.append(type(error).__name__)
+            break
     return approved, "partial_audited" if approved else "silent_unverified"

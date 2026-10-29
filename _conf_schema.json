@@ -15,12 +15,12 @@
     "default": ""
   },
   "isolate_research_memory": {
-    "description": "技术问答不进入 LivingMemory 总结输入（日常记忆保持，适配2.8.1私聊）",
+    "description": "资料问答不进入 LivingMemory 总结输入（日常记忆保持，适配2.8.1/2.8.2私聊）",
     "type": "bool",
     "default": true
   },
   "model_timeout_seconds": {
-    "description": "每次规划、审查、修正或短聊压缩的超时秒数（大于0）",
+    "description": "每次规划、审查、补查后回答、修正或短聊压缩的超时秒数（大于0）",
     "type": "float",
     "default": 90
   },
@@ -35,7 +35,7 @@
     "default": 240
   },
   "save_traces": {
-    "description": "在插件数据目录保存最近20次检索原文与最终答案，便于核查",
+    "description": "保存最近20次检索原文、候选输出、校验原因与最终答案，便于核查",
     "type": "bool",
     "default": true
   },

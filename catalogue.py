@@ -179,7 +179,7 @@ class EvidenceStore:
                         "sources": sources,
                         "items": items,
                     }:
-                        validate_items(
+                        record["items"] = validate_items(
                             {"items": items}, Packet(question, sources=sources)
                         )
                     case _:
