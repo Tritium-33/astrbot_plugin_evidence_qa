@@ -2,7 +2,7 @@
   "enabled": {
     "type": "bool",
     "default": true,
-    "hint": "启用私聊、群聊及WebChat路由（不含Live；仅直聊群主动唤醒普通消息）",
+    "hint": "启用私聊、群聊及WebChat路由（不含Live；不主动唤醒消息）",
     "description": "启用插件"
   },
   "model_routing_enabled": {
@@ -116,14 +116,14 @@
   "enable_group": {
     "default": true,
     "type": "bool",
-    "hint": "接管群聊回复并启用直聊群；关闭后不接管，原生或Chat Plus仍可自行回复。",
+    "hint": "接管群聊回复并启用免冷却群规则；关闭后不接管，原生或Chat Plus仍可自行回复。",
     "description": "启用群聊"
   },
-  "direct_reply_groups": {
-    "description": "直聊群",
+  "no_cooldown_groups": {
+    "description": "免冷却群",
     "type": "list",
     "default": [],
-    "hint": "每行一个群号，也支持机器人平台ID:群号。指定群每条正常消息直接回应，无需前缀或@，跳过Chat Plus概率、读空气、疲劳和密度限制；模型仍按群聊分工。其他群不变，原生白名单与指令权限照常生效。移除群号即恢复通常触发方式。"
+    "hint": "每行一个群号。仅取消Chat Plus回复密度封顶、对话疲劳及注意力冷却；保留原有接话概率、DeepSeek读空气判断、@和关键词规则。不会每条必回，也不会主动唤醒消息。其他群与模型分工不变。"
   },
   "isolate_research_memory": {
     "type": "bool",
