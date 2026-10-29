@@ -92,12 +92,20 @@ class Plan:
     item_ids: list[int] = field(default_factory=list)
     detailed: bool = False
     local_only: bool = False
+    technical: bool = False
 
     @classmethod
     def parse(cls, raw, original):
         data = json_object(raw)
         route = data.get("route")
-        if route not in ("chat", "research", "citation", "memory_control", "delegate"):
+        if route not in (
+            "chat",
+            "research",
+            "catalogue",
+            "citation",
+            "memory_control",
+            "delegate",
+        ):
             raise ValueError("Invalid task route")
         question = data.get("question")
         if not isinstance(question, str) or not question.strip():
@@ -121,6 +129,7 @@ class Plan:
             else [],
             data.get("detailed") is True,
             data.get("local_only") is True,
+            data.get("technical") is True,
         )
 
 
@@ -171,7 +180,7 @@ class Packet:
         }
 
 
-def validate_items(data, packet, *, strict=True, issues=None):
+def validate_items(data, packet, *, strict=True, issues=None, require_local_quote=True):
     if not isinstance(packet.sources, list) or any(
         not isinstance(s, dict)
         or not isinstance(s.get("id"), str)
@@ -194,7 +203,14 @@ def validate_items(data, packet, *, strict=True, issues=None):
     for index, item in enumerate(items[:12]):
         try:
             clean.append(
-                validate_item(item, sources, strict=strict, issues=issues, index=index)
+                validate_item(
+                    item,
+                    sources,
+                    strict=strict,
+                    issues=issues,
+                    index=index,
+                    require_local_quote=require_local_quote,
+                )
             )
         except (ValueError, TypeError) as error:
             if strict:
@@ -203,7 +219,7 @@ def validate_items(data, packet, *, strict=True, issues=None):
     return clean
 
 
-def validate_item(item, sources, *, strict, issues, index):
+def validate_item(item, sources, *, strict, issues, index, require_local_quote=True):
     if not isinstance(item, dict) or not isinstance(item.get("text"), str):
         raise TypeError("Invalid claim")
     refs = item.get("evidence")
@@ -231,7 +247,7 @@ def validate_item(item, sources, *, strict, issues, index):
             if quote:
                 citation["quote"] = quote
         if "quote" not in citation:
-            if source.get("channel") != "web":
+            if source.get("channel") != "web" and require_local_quote:
                 raise ValueError("Local quote is empty or not verbatim")
             if ref.get("quote"):
                 if strict:
@@ -239,8 +255,7 @@ def validate_item(item, sources, *, strict, issues, index):
                 issues.append(
                     f"item[{index}]: unverified web quotation removed; audit source support"
                 )
-            # Web claims cite a retrieved source, just as a search tool response does.
-            # Semantic support is still checked by AUDIT; never render an invented quote.
+            # Direct answers may cite a source without an exact quotation.
         clean_refs.append(citation)
     return {"text": item["text"].strip(), "evidence": clean_refs}
 
@@ -285,92 +300,128 @@ def render(items, missing, packet, *, citations=False):
     return "\n\n".join(line for line in lines if line).strip()
 
 
-async def review(ask, retrieve, packet, draft):
-    """Keep supported items and allow bounded search/read follow-ups or one repair."""
-    approved = []
-    extra_queries = 0
-    repaired = False
-    for attempt in range(3):
-        step = {
-            "attempt": attempt + 1,
-            "output": diagnostic(draft),
-            "output_chars": len(str(draft)),
-            "output_truncated": len(str(draft)) > 16000,
-            "issues": [],
-        }
-        packet.diagnostics.append(step)
-        queries = []
-        try:
-            data = json_object(draft)
-            missing = strings(data.get("missing"), 12)
-            queries = strings(data.get("queries"), 2)
-            items = validate_items(data, packet, strict=False, issues=step["issues"])
-            step["valid_items"] = len(items)
-            if items:
-                audit_text = await ask(
-                    prompts.AUDIT,
-                    {**packet.payload(), "items": items, "missing": missing},
-                )
-                step["audit_output"] = diagnostic(audit_text)
-                audit = json_object(audit_text)
-                step["audit"] = audit
-                step.pop("audit_output")
-                if all(
-                    audit.get(k) is True
-                    for k in ("supported", "complete", "process_ok")
-                ):
-                    if not step["issues"]:
-                        return items, "model_audited"
-                    # Other malformed items do not invalidate these individually audited items.
-                    approved = items
-                    if not missing and not queries:
-                        return approved, "partial_audited"
-                elif audit.get("process_ok") is True:
-                    indices = audit.get("accepted", [])
-                    if isinstance(indices, list):
-                        approved = [
-                            items[i]
-                            for i in indices
-                            if type(i) is int and 0 <= i < len(items)
-                        ]
-                else:
-                    approved = []
-                step["issues"].extend(strings(audit.get("issues"), 12))
-                queries = strings(audit.get("queries"), 2) or queries
-            else:
-                step["issues"].append(
-                    "No supported items; use the available sources or search/read further."
-                )
-        except (ValueError, TypeError) as error:
-            step["issues"].append(diagnostic(error, 600))
-        except Exception as error:  # noqa: BLE001 - audit provider boundary
-            step["error"] = diagnostic(error, 600)
-            packet.errors.append(type(error).__name__)
-            break
-        if attempt == 2:
-            break
-        followups = [q for q in queries if q not in packet.queries][: 2 - extra_queries]
-        if not followups and repaired:
-            break
-        if not followups:
-            repaired = True
-        try:
-            for query in followups:
-                await retrieve(query, packet)
-                extra_queries += 1
-            system = prompts.FOLLOWUP if followups else prompts.REPAIR
-            draft = await ask(
-                system,
-                {
-                    **packet.payload(),
-                    "draft": draft,
-                    "accepted_items": approved,
-                    "issues": step["issues"],
-                    "remaining_followups": 2 - extra_queries,
-                },
+def direct_answer(text, packet):
+    """Remove internal source tags without another model call or rewriting the answer."""
+    sources = {s["id"]: s for s in packet.sources}
+    items = []
+    marker = re.compile(r"\[\[(S\d+)\]\]")
+    for paragraph in re.split(r"\n\s*\n", text):
+        refs = list(dict.fromkeys(marker.findall(paragraph)))
+        clean = marker.sub("", paragraph).strip()
+        refs = [identity for identity in refs if identity in sources][:3]
+        if clean and refs and len(items) < 12:
+            items.append({"text": clean, "evidence": [{"source": i} for i in refs]})
+    return marker.sub("", text).strip(), items
+
+
+def focused_sources(candidates, packet):
+    """Include cited sources and available adjacent local context, without truncating it."""
+    ids = {
+        r.get("source")
+        for item in candidates
+        for r in item.get("evidence", [])
+        if isinstance(r, dict) and isinstance(r.get("source"), str)
+    }
+    cited = [s for s in packet.sources if s["id"] in ids]
+    if not cited:
+        return [s for s in packet.sources if s.get("channel") != "web"]
+    nearby = {
+        (s.get("kb_id"), s.get("doc_id"), s.get("chunk_index"))
+        for s in cited
+        if s.get("channel") != "web" and type(s.get("chunk_index")) is int
+    }
+    return [
+        s
+        for s in packet.sources
+        if s["id"] in ids
+        or (
+            s.get("channel") != "web"
+            and type(s.get("chunk_index")) is int
+            and any(
+                (s.get("kb_id"), s.get("doc_id"), s["chunk_index"] + delta) in nearby
+                for delta in (-1, 0, 1)
             )
-        except Exception as error:  # noqa: BLE001 - provider boundary
-            step["error"] = diagnostic(error, 600)
-            packet.errors.append(type(error).__name__)
-            break
-    return approved, "partial_audited" if approved else "silent_unverified"
+        )
+    ]
+
+
+async def focused_review(ask, packet, draft):
+    """One local-technical audit, with inline corrections; no repair or re-audit loop."""
+    step = {"stage": "local_audit", "output": diagnostic(draft), "issues": []}
+    packet.diagnostics.append(step)
+    try:
+        raw_items = json_object(draft).get("items")
+        if not isinstance(raw_items, list):
+            raise TypeError("Missing items")
+    except (TypeError, ValueError) as error:
+        # The single audit can recover an ordinary prose draft; no separate formatter.
+        raw_items = [{"text": draft, "evidence": []}]
+        step["issues"].append(diagnostic(error, 600))
+    if not raw_items:
+        return [], "local_no_items"
+    sources = {s["id"]: s for s in packet.sources}
+    valid, direct, candidates = {}, {}, []
+    for index, raw in enumerate(raw_items[:12]):
+        try:
+            item = validate_item(
+                raw, sources, strict=False, issues=step["issues"], index=index
+            )
+            web_only = all(
+                sources[r["source"]].get("channel") == "web" for r in item["evidence"]
+            )
+            if web_only:
+                direct[index] = item
+                continue
+            valid[index] = item
+        except (TypeError, ValueError) as error:
+            step["issues"].append(f"item[{index}]: {error}")
+        if isinstance(raw, dict):
+            candidates.append(
+                {
+                    "index": index,
+                    "text": str(raw.get("text", "")),
+                    "evidence": raw.get("evidence")
+                    if isinstance(raw.get("evidence"), list)
+                    else [],
+                }
+            )
+    if not candidates:
+        return list(direct.values()), "direct_web"
+    selected = focused_sources(candidates, packet)
+    focus = Packet(packet.question, sources=selected)
+    checked = dict(direct)
+    try:
+        result = await ask(
+            prompts.AUDIT,
+            {
+                "question": packet.question,
+                "original_question": packet.original_question,
+                "items": candidates,
+                "sources": selected,
+                "program_issues": step["issues"],
+            },
+        )
+        step["audit_output"] = diagnostic(result)
+        audit = json_object(result)
+        step["audit"] = audit
+        step.pop("audit_output")
+        for index in audit.get("accepted", []):
+            if type(index) is int and index in valid:
+                checked[index] = valid[index]
+        for correction in audit.get("corrections", []):
+            if not isinstance(correction, dict):
+                continue
+            index = correction.get("index")
+            if type(index) is not int or index not in {i["index"] for i in candidates}:
+                continue
+            checked.pop(index, None)
+            try:
+                checked[index] = validate_items({"items": [correction]}, focus)[0]
+            except (TypeError, ValueError) as error:
+                step["issues"].append(f"correction[{index}]: {error}")
+        step["issues"].extend(strings(audit.get("issues"), 12))
+    except Exception as error:  # noqa: BLE001 - single audit provider boundary
+        step["error"] = diagnostic(error, 600)
+        packet.errors.append(type(error).__name__)
+        return list(direct.values()), "local_audit_failed"
+    return [checked[i] for i in sorted(checked)], "local_audited"

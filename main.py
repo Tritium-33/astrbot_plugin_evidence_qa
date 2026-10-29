@@ -3,7 +3,6 @@
 import asyncio
 import json
 import math
-import re
 from dataclasses import asdict
 from datetime import datetime
 from uuid import uuid4
@@ -14,6 +13,7 @@ from astrbot.api.platform import MessageType
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
+from astrbot.core.agent.tool import FunctionTool, ToolSet
 
 from . import prompts, web
 from .catalogue import Catalogue, EvidenceStore
@@ -21,24 +21,16 @@ from .evidence import (
     Packet,
     Plan,
     diagnostic,
+    direct_answer,
+    focused_review,
     history_text,
-    json_object,
     render,
-    review,
-    strings,
+    source_label,
 )
 from .integration import SelectionBridge
 from .memory import MEMORY_STEPS, SKIP_MEMORY, MemoryBridge
 
 STATE = "evidence_qa.state"
-
-
-def short_chat(text):
-    return (
-        bool(text.strip())
-        and len(text.strip()) <= 80
-        and len([s for s in re.split(r"[。！？!?\n]+", text) if s.strip()]) <= 3
-    )
 
 
 class BufferedPrivateChat(filter.CustomFilter):
@@ -166,7 +158,7 @@ class EvidenceQAPlugin(Star):
                 phase = next(
                     (
                         name.lower()
-                        for name in ("PLAN", "AUDIT", "REPAIR", "FOLLOWUP", "SHORTEN")
+                        for name in ("PLAN", "AUDIT")
                         if system == getattr(prompts, name)
                     ),
                     "model",
@@ -229,6 +221,7 @@ class EvidenceQAPlugin(Star):
                     "id": r["id"],
                     "question": r["question"],
                     "items": [i["text"] for i in r["items"]],
+                    "has_answer": bool(r.get("answer")),
                 }
                 for r in self.evidence_store.recent(scope)
             ]
@@ -258,6 +251,8 @@ class EvidenceQAPlugin(Star):
             elif plan.source in ("kb", "both") and not plan.kb_names:
                 plan.source = "web"
             state.update(plan=plan, provider=provider, status="planned")
+            if plan.route == "catalogue":
+                state["catalogue"] = catalogue
             if plan.route == "research":
                 target = self.config.get("research_provider_id", "").strip()
                 if target and not event.get_extra("selected_provider"):
@@ -266,7 +261,7 @@ class EvidenceQAPlugin(Star):
             event.set_extra(
                 SKIP_MEMORY,
                 plan.exclude_memory
-                or plan.route in ("memory_control", "citation")
+                or plan.route in ("memory_control", "citation", "catalogue")
                 or (
                     plan.route == "research"
                     and self.config.get("isolate_research_memory", True)
@@ -352,7 +347,8 @@ class EvidenceQAPlugin(Star):
             state["scope"] = [event.unified_msg_origin, req.conversation.cid]
         if plan.route == "delegate":
             return
-        req.func_tool = None
+        if plan.route != "research":
+            req.func_tool = None
         if plan.route == "chat":
             if not plan.detailed:
                 req.system_prompt = (req.system_prompt or "") + "\n\n" + prompts.CHAT
@@ -368,15 +364,73 @@ class EvidenceQAPlugin(Star):
                     packet,
                     source_override="web",
                 )
-            req.system_prompt = (
-                (req.system_prompt or "") + "\n\n" + prompts.ANSWER_RULES
+            state["answer_mode"] = (
+                "local_technical" if self.needs_audit(plan, packet) else "direct"
             )
+            rules = (
+                prompts.ANSWER_RULES
+                if state["answer_mode"] == "local_technical"
+                else prompts.DIRECT
+            )
+            req.system_prompt = (req.system_prompt or "") + "\n\n" + rules
+            req.func_tool = self.lookup_tools(event, packet)
             req.extra_user_content_parts.append(
                 TextPart(
                     text=json.dumps(packet.payload(), ensure_ascii=False, default=str)
                 ).mark_as_temp()
             )
         state["generation_started"] = asyncio.get_running_loop().time()
+
+    @staticmethod
+    def needs_audit(plan, packet):
+        return (
+            plan.technical
+            and plan.source in ("kb", "both")
+            and any(s.get("channel") != "web" for s in packet.sources)
+        )
+
+    def lookup_tools(self, event, packet):
+        """Request-scoped native tool: further searches happen before the final answer."""
+        state = event.get_extra(STATE)
+
+        async def lookup(_event, query):
+            if state.get("lookup_calls", 0) >= 2:
+                return "本轮补查预算已用完，请根据现有材料直接完成回答。"
+            state["lookup_calls"] = state.get("lookup_calls", 0) + 1
+            if isinstance(query, str) and query.strip():
+                await self.retrieve(event, query.strip(), packet)
+            if state["lookup_calls"] >= 2:
+                toolset.tools.clear()
+            return json.dumps(
+                {**packet.payload(), "remaining_lookups": 2 - state["lookup_calls"]},
+                ensure_ascii=False,
+                default=str,
+            )
+
+        toolset = ToolSet(
+            [
+                FunctionTool(
+                    name="evidence_lookup",
+                    description="材料不足时换词补查或读取具体HTTP(S)网址，沿用本轮允许的资料范围。最多调用两次；材料足够就直接回答。",
+                    parameters={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                    handler=lookup,
+                )
+            ]
+        )
+        return toolset
+
+    def catalogue_answer(self, state):
+        documents = state.get("catalogue", [])
+        if not documents:
+            return ""
+        return "已缓存的资料目录与内容概览：\n\n" + "\n\n".join(
+            f"- **{d['doc_name']}**（{d['kb_name']}）\n  {d['summary']}"
+            for d in documents
+        )
 
     def citation_answer(self, state):
         plan = state["plan"]
@@ -388,6 +442,15 @@ class EvidenceQAPlugin(Star):
             items = [items[i] for i in plan.item_ids if i < len(items)]
         packet = Packet(record["question"], sources=record["sources"])
         state["citation_record"] = record["id"]
+        if record.get("catalogue"):
+            return (
+                "来源：手动更新时保存的原生知识库文档目录与概览。\n\n"
+                + self.catalogue_answer(record)
+            )
+        if not record["items"] and record.get("answer") and packet.sources:
+            return "本轮检索到的来源（未建立逐句对应）：\n\n" + "\n".join(
+                "- " + source_label(s, packet) for s in packet.sources
+            )
         return render(items, [], packet, citations=True)
 
     @filter.on_llm_response(priority=100)
@@ -420,43 +483,32 @@ class EvidenceQAPlugin(Star):
         try:
             if plan.route == "chat":
                 answer = resp.completion_text
-                if not plan.detailed and not short_chat(answer):
-                    answer = await self.ask(
-                        state["writer_provider"],
-                        prompts.SHORTEN,
-                        {"message": state["question"], "reply": answer},
-                        event,
-                    )
-                    if not short_chat(answer):
-                        answer = ""
+                state["verification"] = "direct_chat"
+            elif plan.route == "catalogue":
+                answer = self.catalogue_answer(state)
+                state["verification"] = "cached_catalogue"
             elif plan.route == "citation":
                 answer = self.citation_answer(state)
             elif plan.route == "memory_control":
                 answer = "这轮已请求跳过记忆记录，已有记忆没有改动。"
             elif plan.route == "research":
                 packet = state.get("packet", Packet(plan.question))
-                try:
-                    followups = strings(
-                        json_object(resp.completion_text).get("queries"), 2
-                    )
-                except (ValueError, TypeError):
-                    followups = []
-                if packet.sources or followups:
-                    items, status = await review(
-                        lambda system, payload: self.ask(
-                            state["provider"]
-                            if system == prompts.AUDIT
-                            else state["writer_provider"],
-                            system,
-                            payload,
-                            event,
-                        ),
-                        lambda query, p: self.retrieve(event, query, p),
-                        packet,
-                        resp.completion_text,
-                    )
+                if packet.sources:
+                    if self.needs_audit(plan, packet):
+                        state["answer_mode"] = "local_technical"
+                        items, status = await focused_review(
+                            lambda system, payload: self.ask(
+                                state["provider"], system, payload, event
+                            ),
+                            packet,
+                            resp.completion_text,
+                        )
+                        answer = render(items, [], packet)
+                    else:
+                        state["answer_mode"] = "direct"
+                        answer, items = direct_answer(resp.completion_text, packet)
+                        status = "direct_research"
                     state.update(items=items, verification=status)
-                    answer = render(items, [], packet)
                     if not answer:
                         logger.warning(
                             "[证据问答 %s] 无可发送答案：%s；各轮校验=%s",
@@ -497,6 +549,25 @@ class EvidenceQAPlugin(Star):
                 else "这轮已请求不保存，但尚未确认记忆插件执行了跳过。"
             )
         messages = run_context.messages
+        # Keep final dialogue across models, without carrying search tool payloads forever.
+        lookup_ids = {
+            call.id
+            for message in messages
+            for call in message.tool_calls or []
+            if call.function.name == "evidence_lookup"
+        }
+        if lookup_ids:
+            retained = []
+            for message in messages:
+                if message.tool_call_id in lookup_ids:
+                    continue
+                if message.tool_calls:
+                    calls = [c for c in message.tool_calls if c.id not in lookup_ids]
+                    if not calls:
+                        continue
+                    message.tool_calls = calls
+                retained.append(message)
+            messages[:] = retained
         state["history_synced"] = False
         if messages and messages[-1].role == "assistant":
             messages[-1].content = [TextPart(text=resp.completion_text)]
@@ -511,7 +582,7 @@ class EvidenceQAPlugin(Star):
             state["elapsed_seconds"],
             state["memory_isolated"],
         )
-        if state["plan"].route == "research":
+        if state["plan"].route in ("research", "catalogue"):
             packet = state.get("packet", Packet(state["question"]))
             try:
                 items = state.get("items", []) if resp.completion_text else []
@@ -525,7 +596,11 @@ class EvidenceQAPlugin(Star):
                         "question": state["plan"].question,
                         "answer": resp.completion_text,
                         "items": items,
-                        "sources": [s for s in packet.sources if s["id"] in used],
+                        "sources": [s for s in packet.sources if s["id"] in used]
+                        if items
+                        else (packet.sources if resp.completion_text else []),
+                        "mode": state.get("answer_mode", "direct"),
+                        "catalogue": state.get("catalogue", []),
                     }
                 )
                 if self.config.get("save_traces", True):

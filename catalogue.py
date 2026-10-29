@@ -180,7 +180,9 @@ class EvidenceStore:
                         "items": items,
                     }:
                         record["items"] = validate_items(
-                            {"items": items}, Packet(question, sources=sources)
+                            {"items": items},
+                            Packet(question, sources=sources),
+                            require_local_quote=record.get("mode") != "direct",
                         )
                     case _:
                         raise ValueError("Invalid evidence record")

@@ -101,6 +101,7 @@ class SelectionBridge:
                 state["streaming"] = False
             if state and state["plan"].route in (
                 "citation",
+                "catalogue",
                 "memory_control",
                 "unavailable",
             ):
@@ -112,7 +113,22 @@ class SelectionBridge:
                         yield chain
                 return
 
-            iterator = original(runner, *args, **kwargs)
+            # Native lookup steps may yield intermediate text; only the final answer is sent.
+            options = list(args)
+            for index, key, value in (
+                (1, "show_tool_use", False),
+                (2, "show_tool_call_result", False),
+            ):
+                if len(options) > index:
+                    options[index] = value
+                else:
+                    kwargs[key] = value
+            if state and state["plan"].route == "research":
+                if options:
+                    options[0] = min(options[0], 3)
+                else:
+                    kwargs["max_step"] = min(kwargs.get("max_step", 128), 3)
+            iterator = original(runner, *options, **kwargs)
             reason = None
             try:
                 try:
@@ -122,19 +138,17 @@ class SelectionBridge:
                         async with self.plugin.window(
                             event, self.plugin.limits["turn_timeout_seconds"]
                         ):
-                            await anext(iterator)
+                            async for _ in iterator:
+                                if state.get("status") == "finished":
+                                    break
                         if state.get("status") != "finished":
-                            reason = "unverified_output"
-                except StopAsyncIteration:
-                    if (
-                        event.is_stopped()
-                        or event.get_extra("agent_user_aborted")
-                        or event.get_extra("agent_stop_requested")
-                    ):
-                        return
-                    if state and state.get("status") == "finished":
-                        return
-                    reason = "runner_incomplete"
+                            if (
+                                event.is_stopped()
+                                or event.get_extra("agent_user_aborted")
+                                or event.get_extra("agent_stop_requested")
+                            ):
+                                return
+                            reason = "runner_incomplete"
                 except TimeoutError:
                     reason = "turn_timeout"
                 except Exception as error:  # noqa: BLE001 - native runner boundary

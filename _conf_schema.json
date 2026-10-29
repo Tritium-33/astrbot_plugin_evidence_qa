@@ -5,12 +5,12 @@
     "default": true
   },
   "worker_provider_id": {
-    "description": "任务规划与语义审查模型的 Provider ID（建议 DeepSeek；留空用当前模型）",
+    "description": "任务规划、本地技术单次核验与目录概括的 Provider ID（建议 DeepSeek；留空用当前模型）",
     "type": "string",
     "default": ""
   },
   "research_provider_id": {
-    "description": "技术问答本轮使用的 Provider ID（留空保持当前模型，日常聊天不切换）",
+    "description": "联网及本地资料回答的 Provider ID（留空保持当前模型，日常聊天不切换）",
     "type": "string",
     "default": ""
   },
@@ -20,7 +20,7 @@
     "default": true
   },
   "model_timeout_seconds": {
-    "description": "每次规划、审查、补查后回答、修正或短聊压缩的超时秒数（大于0）",
+    "description": "每次规划、本地技术核验及目录概括的超时秒数（大于0，原生回答另受提供商与整轮超时约束）",
     "type": "float",
     "default": 90
   },
