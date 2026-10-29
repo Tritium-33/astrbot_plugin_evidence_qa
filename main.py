@@ -75,6 +75,7 @@ class EvidenceQAPlugin(Star):
 
     async def initialize(self):
         from astrbot.core import astr_main_agent
+        from astrbot.core.pipeline.preprocess_stage.stage import PreProcessStage
         from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
 
         for cache in (self.catalogue, self.evidence_store, self.routing):
@@ -83,6 +84,7 @@ class EvidenceQAPlugin(Star):
             except (OSError, ValueError, TypeError):
                 logger.warning("[证据问答] 缓存读取失败：%s", cache.path.name)
         self.selection.install(astr_main_agent, internal)
+        self.selection.install_image_recovery(PreProcessStage)
         self.routing.attach_gcp()
         logger.info(
             "[证据问答] AstrBot 4.29.3：接管%d个入口；目录仅加载缓存，更新请用 /资料目录更新。",

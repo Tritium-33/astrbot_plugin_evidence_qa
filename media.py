@@ -20,6 +20,28 @@ from astrbot.core.utils.quoted_message_parser import (
 MEDIA = "evidence_qa.media"
 
 
+async def recover_onebot_image(event, component):
+    """Resolve a failed QQ download through the logged-in OneBot client."""
+    data = await event.bot.call_action(
+        action="get_image", file=component.file, self_id=event.get_self_id()
+    )
+    # NapCat's file is its downloaded local original; url may still be the same
+    # expired CDN URL. Prefer the readable file, including when QQ runs locally.
+    for field in ("file", "path"):
+        ref = data.get(field)
+        if not isinstance(ref, str) or not ref:
+            continue
+        path = file_uri_to_path(ref) if ref.startswith("file://") else ref
+        if os.path.isfile(path):
+            return path
+    if data.get("base64"):
+        return "base64://" + data["base64"]
+    ref = data.get("url")
+    if isinstance(ref, str) and ref and ref != (component.url or component.file):
+        return ref
+    raise ValueError("OneBot did not return a usable image")
+
+
 def unique_refs(refs):
     found = {}
     for ref in refs:

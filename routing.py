@@ -306,10 +306,11 @@ class AnswerProvider:
             try:
                 response = await base.text_chat(**call)
                 logger.info(
-                    "[证据问答] answer=%s effort=%s profile=%s",
+                    "[证据问答] answer=%s effort=%s profile=%s images=%d",
                     identity,
                     self.state["reasoning_effort"],
                     self.state["answer_profile"],
+                    len(call.get("image_urls") or []),
                 )
                 return response
             except Exception as error:

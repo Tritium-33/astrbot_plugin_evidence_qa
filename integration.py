@@ -11,7 +11,7 @@ from astrbot.core.message.message_event_result import (
     ResultContentType,
 )
 
-from .media import apply_to_request
+from .media import apply_to_request, recover_onebot_image
 
 STATE = "evidence_qa.state"
 
@@ -71,6 +71,35 @@ class SelectionBridge:
     def _patch(self, owner, name, replacement):
         self.patches.append((owner, name, getattr(owner, name), replacement))
         setattr(owner, name, replacement)
+
+    def install_image_recovery(self, stage):
+        original = stage._normalize_image_component
+
+        @wraps(original)
+        async def normalize(stage_self, event, component):
+            try:
+                return await original(stage_self, event, component)
+            except Exception:
+                if not (
+                    self.managed(event)
+                    and event.get_platform_name() == "aiocqhttp"
+                    and component.file
+                ):
+                    raise
+                before = component.file, component.path, component.url
+                try:
+                    async with asyncio.timeout(
+                        self.plugin.limits["page_timeout_seconds"]
+                    ):
+                        ref = await recover_onebot_image(event, component)
+                        component.file = component.url = ref
+                        await original(stage_self, event, component)
+                except (Exception, asyncio.CancelledError):
+                    component.file, component.path, component.url = before
+                    raise
+                logger.info("[证据问答] QQ图片已通过 OneBot get_image 恢复")
+
+        self._patch(stage, "_normalize_image_component", normalize)
 
     def _install_media(self, owner):
         original = owner.collect_initial_request
