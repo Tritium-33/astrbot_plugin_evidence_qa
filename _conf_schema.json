@@ -1,0 +1,7 @@
+{
+  "enabled": {"description": "启用私聊证据问答", "type": "bool", "default": true},
+  "worker_provider_id": {"description": "任务规划与语义审查模型的 Provider ID（建议 DeepSeek；留空用当前模型）", "type": "string", "default": ""},
+  "research_provider_id": {"description": "技术问答本轮使用的 Provider ID（留空保持当前模型，日常聊天不切换）", "type": "string", "default": ""},
+  "isolate_research_memory": {"description": "技术问答不进入 LivingMemory 总结输入（日常记忆保持，适配2.8.1私聊）", "type": "bool", "default": true},
+  "save_traces": {"description": "在插件数据目录保存最近20次检索原文与最终答案，便于核查", "type": "bool", "default": true}
+}
