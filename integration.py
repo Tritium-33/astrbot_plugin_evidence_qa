@@ -48,9 +48,7 @@ class SelectionBridge:
 
         @wraps(original)
         async def select(event, plugin_context):
-            if self.plugin.group_gate.blocked(event) or self.plugin.routing.blocked(
-                event
-            ):
+            if self.plugin.routing.blocked(event):
                 event.stop_event()
                 return None
             if self.managed(event) and plugin_context is self.plugin.context:
@@ -116,9 +114,6 @@ class SelectionBridge:
         @wraps(original_process)
         async def process(stage_self, event):
             if self.active:
-                if self.plugin.group_gate.blocked(event):
-                    event.stop_event()
-                    return
                 receipt = control.admit(event)
                 if receipt:
                     await event.send(event.plain_result(receipt))
@@ -137,11 +132,7 @@ class SelectionBridge:
         async def send(event, message):
             if not self.active:
                 return await original_send(event, message)
-            if (
-                self.plugin.group_gate.blocked(event)
-                or control.blocked(event)
-                or not limit.acquire(event)
-            ):
+            if control.blocked(event) or not limit.acquire(event):
                 event.clear_result()
                 limit.release(event)
                 return

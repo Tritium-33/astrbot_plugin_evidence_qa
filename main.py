@@ -29,9 +29,7 @@ from .evidence import (
     source_label,
 )
 from .group_control import GroupControl
-from .group_gate import GroupGate
 from .group_limit import GroupLimit
-from .group_panel import GroupPanel
 from .integration import SelectionBridge
 from .memory import MEMORY_STEPS, SKIP_MEMORY, MemoryBridge
 from .routing import ModelRouting
@@ -43,9 +41,6 @@ class BufferedChat(filter.CustomFilter):
     plugin = None
 
     def filter(self, event, cfg):
-        if self.plugin and self.plugin.group_gate.blocked(event):
-            event.stop_event()
-            return False
         if self.plugin and self.plugin.routing.blocked(event):
             event.stop_event()
             return False
@@ -78,26 +73,19 @@ class EvidenceQAPlugin(Star):
         self.routing = ModelRouting(self, folder / "routing.json")
         self.group_control = GroupControl(self, folder / "group_control.json")
         self.group_limit = GroupLimit(self)
-        self.group_gate = GroupGate(self, folder / "group_switches.json")
-        self.group_panel = GroupPanel(self)
         self.memory = MemoryBridge()
         self.selection = SelectionBridge(self)
         BufferedChat.plugin = self
 
     async def initialize(self):
-        from aiocqhttp.api_impl import UnifiedApi
         from astrbot.core import astr_main_agent
         from astrbot.core.pipeline.preprocess_stage.stage import PreProcessStage
         from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
         from astrbot.core.pipeline.process_stage.stage import ProcessStage
-        from astrbot.core.pipeline.scheduler import PipelineScheduler
         from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
             AiocqhttpMessageEvent,
         )
 
-        self.group_gate.load()
-        self.group_gate.install(PipelineScheduler, UnifiedApi)
-        self.group_panel.register()
         for cache in (
             self.catalogue,
             self.evidence_store,
@@ -116,16 +104,11 @@ class EvidenceQAPlugin(Star):
             "[证据问答] AstrBot 4.29.3：接管%d个入口；目录仅加载缓存，更新请用 /资料目录更新。",
             len(self.selection.patches),
         )
-        logger.info(
-            "[群聊控制] 面板已启用；%d个群关闭，入口与 OneBot 发送检查已接入。",
-            sum(not state["enabled"] for state in self.group_gate.states.values()),
-        )
 
     def enabled(self, event):
         selected = getattr(event, "plugins_name", None)
         return (
             self.config.get("enabled", True)
-            and not self.group_gate.blocked(event)
             and not self.routing.blocked(event)
             and (
                 event.get_message_type() == MessageType.FRIEND_MESSAGE
@@ -888,8 +871,6 @@ class EvidenceQAPlugin(Star):
             old.unlink()
 
     async def terminate(self):
-        self.group_panel.close()
-        self.group_gate.close()
         self.selection.close()
         self.routing.close()
         self.memory.close()

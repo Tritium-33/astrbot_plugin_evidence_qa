@@ -1,8 +1,0 @@
-{
-  "views": {
-    "group-control": {
-      "title": "群聊控制",
-      "description": "按群一键开启或关闭发言，支持批量操作。"
-    }
-  }
-}

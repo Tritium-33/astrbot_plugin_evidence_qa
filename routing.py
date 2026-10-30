@@ -3,7 +3,6 @@
 import copy
 import json
 import sys
-from contextlib import nullcontext
 from datetime import datetime
 from functools import wraps
 from types import MethodType
@@ -47,11 +46,12 @@ class ModelRouting:
         self._mode = "gpt"
         self.reason = "default"
         self.gcp_patches = []
+        self.active = True
         self.groups = GroupPolicy(plugin)
 
     @property
     def enabled(self):
-        return bool(self.config.get("model_routing_enabled", False))
+        return self.active and bool(self.config.get("model_routing_enabled", False))
 
     @property
     def mode(self):
@@ -174,6 +174,8 @@ class ModelRouting:
 
     def attach_gcp(self):
         """GCP's independent proactive generation does not enter the native runner."""
+        if not self.active:
+            return
         for name, module in list(sys.modules.items()):
             if "group_chat_plus" in name:
                 self.groups.attach(module, name)
@@ -206,29 +208,21 @@ class ModelRouting:
                     chat_id,
                     chat_key,
                 ):
-                    scope = (
-                        nullcontext(True)
-                        if is_private
-                        else self.plugin.group_gate.proactive(platform_id, chat_id)
-                    )
-                    with scope as allowed:
-                        if not allowed:
+                    if self.enabled and self.config.get("enabled", True):
+                        if is_private and not self.owner(chat_id, platform_id):
                             return
-                        if self.enabled and self.config.get("enabled", True):
-                            if is_private and not self.owner(chat_id, platform_id):
-                                return
-                            state = {"group": not is_private, "media": {}}
-                            context = ProactiveContext(context, self, state)
-                        return await fn(
-                            cls,
-                            context,
-                            config,
-                            plugin_instance,
-                            platform_id,
-                            is_private,
-                            chat_id,
-                            chat_key,
-                        )
+                        state = {"group": not is_private, "media": {}}
+                        context = ProactiveContext(context, self, state)
+                    return await fn(
+                        cls,
+                        context,
+                        config,
+                        plugin_instance,
+                        platform_id,
+                        is_private,
+                        chat_id,
+                        chat_key,
+                    )
 
                 return classmethod(process)
 
@@ -248,7 +242,7 @@ class ModelRouting:
 
         @wraps(original.__func__)
         async def judge(context, event, *args, **kwargs):
-            if self.plugin.group_gate.blocked(event) or self.blocked(event):
+            if self.blocked(event):
                 return False
             if self.enabled and self.plugin.enabled(event):
                 context = ProactiveContext(context, self, {})
@@ -259,6 +253,7 @@ class ModelRouting:
         self.gcp_patches.append((owner, "should_reply", original, replacement))
 
     def close(self):
+        self.active = False
         self.groups.close()
         for owner, name, original, replacement in reversed(self.gcp_patches):
             if owner.__dict__.get(name) is replacement:

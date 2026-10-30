@@ -1,7 +1,7 @@
 name: astrbot_plugin_evidence_qa
 display_name: 证据问答与会话路由
 desc: GPT 回答分工、DeepSeek 辅助与搜索、官方思考档位、额度回退及原生知识库
-version: v0.5.7
+version: v0.5.8
 author: Tritium-33
 repo: https://github.com/Tritium-33/astrbot_plugin_evidence_qa
 astrbot_version: '==4.29.3'
