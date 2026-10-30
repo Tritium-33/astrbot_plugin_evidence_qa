@@ -259,17 +259,15 @@ class SelectionBridge:
                 "unavailable",
             ):
                 await runner._complete_with_assistant_response(
-                    LLMResponse(role="assistant", completion_text="")
+                    LLMResponse(
+                        role="assistant",
+                        completion_text=state.get("failure_message", ""),
+                    )
                 )
                 if state.get("status") == "finished":
                     async for chain in emit(event, runner.get_final_llm_resp()):
                         yield chain
                 return
-
-            if self.plugin.routing.enabled:
-                runner.provider = self.plugin.routing.answer_provider(state, event)
-                runner.fallback_providers = []
-                runner.req.model = None
 
             # Native lookup steps may yield intermediate text; only the final answer is sent.
             options = list(args)
@@ -290,6 +288,12 @@ class SelectionBridge:
             reason = None
             try:
                 try:
+                    if self.plugin.routing.enabled:
+                        runner.provider = self.plugin.routing.answer_provider(
+                            state, event
+                        )
+                        runner.fallback_providers = []
+                        runner.req.model = None
                     async with self.plugin.window(
                         event, self.plugin.limits["turn_timeout_seconds"]
                     ):
@@ -316,6 +320,8 @@ class SelectionBridge:
                     response = runner.get_final_llm_resp()
                 async for chain in emit(event, response):
                     yield chain
+                if reason:
+                    return
                 # Cleanup may log an error, but must not undo or append to an emitted answer.
                 try:
                     async with asyncio.timeout(2):

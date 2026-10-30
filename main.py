@@ -257,7 +257,7 @@ class EvidenceQAPlugin(Star):
                 phase = next(
                     (
                         name.lower()
-                        for name in ("PLAN", "AUDIT")
+                        for name in ("PLAN", "PLAN_RECOVERY", "AUDIT")
                         if system == getattr(prompts, name)
                     ),
                     "model",
@@ -285,6 +285,52 @@ class EvidenceQAPlugin(Star):
             top_k = session.get("top_k", 5)
         return names, top_k
 
+    async def request_plan(self, provider, payload, event, image_urls):
+        """Recover once with the same task context, never guess a chat fallback."""
+        state = event.get_extra(STATE)
+        for attempt in range(2):
+            raw = None
+            stage = "request"
+            try:
+                async with self.window(
+                    event, 15 if attempt else self.limits["model_timeout_seconds"]
+                ):
+                    raw = await self.ask(
+                        provider,
+                        prompts.PLAN_RECOVERY if attempt else prompts.PLAN,
+                        payload,
+                        event,
+                        image_urls=image_urls,
+                    )
+                stage = "parse"
+                data = json_object(raw)
+                plan = Plan.parse(raw, state["question"])
+                if attempt:
+                    state["planning_recovered"] = True
+                    logger.info(
+                        "[证据问答 %s] 规划已恢复：%s", state["trace_id"], plan.route
+                    )
+                return plan, data
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                failure = {
+                    "attempt": attempt + 1,
+                    "stage": stage,
+                    "provider": provider,
+                    "error": type(error).__name__,
+                    "detail": diagnostic(error, 600),
+                    "response_excerpt": diagnostic(raw, 1500)
+                    if raw is not None
+                    else "",
+                    "response_chars": len(raw) if isinstance(raw, str) else 0,
+                }
+                state.setdefault("planning_failures", []).append(failure)
+                await self.write_trace(state, "")
+                if attempt:
+                    raise
+                payload = {**payload, "previous_attempt": failure}
+
     async def plan_turn(self, event):
         if not self.enabled(event) or event.get_extra(STATE) is not None:
             return
@@ -309,6 +355,7 @@ class EvidenceQAPlugin(Star):
             "group": event.get_message_type() == MessageType.GROUP_MESSAGE,
             "sender_id": chat_context["sender_id"],
             "sender_name": chat_context["sender_name"],
+            "planning_stage": "context",
         }
         event.set_extra(STATE, state)
         try:
@@ -329,7 +376,9 @@ class EvidenceQAPlugin(Star):
             )
             scope = [event.unified_msg_origin, session]
             state.update(scope=scope, kb_names=names, top_k=top_k)
+            state["planning_stage"] = "history"
             history = json.loads(conv.history) if conv and conv.history else []
+            state["planning_stage"] = "provider"
             provider = await self.provider_id(event)
             recent = [
                 {
@@ -347,6 +396,7 @@ class EvidenceQAPlugin(Star):
             image_urls = []
             planner = provider
             config = self.context.get_config(umo=event.unified_msg_origin)
+            state["planning_stage"] = "media"
             async with self.window(event, self.limits["retrieval_timeout_seconds"]):
                 await media.resolve_quotes(event, config)
                 attachments = media.collect(event)
@@ -360,9 +410,9 @@ class EvidenceQAPlugin(Star):
                 state["original_images"] = attachments["refs"]
                 state["prepared_images"] = image_urls
             state["planner_provider"] = planner
-            result = await self.ask(
+            state["planning_stage"] = "planner"
+            plan, result = await self.request_plan(
                 planner,
-                prompts.PLAN,
                 {
                     "message": question,
                     "history": history_text(history),
@@ -376,16 +426,15 @@ class EvidenceQAPlugin(Star):
                 event,
                 image_urls=[] if self.routing.enabled else image_urls,
             )
-            plan = Plan.parse(result, question)
             receipt = self.group_control.resolve(
-                event, json_object(result).get("group_action", "none")
+                event, result.get("group_action", "none")
             )
             if receipt:
                 plan = Plan("group_control", question)
                 state["group_receipt"] = receipt
             if self.group_control.restricted(event) and plan.route == "delegate":
                 plan = Plan("chat", question)
-            observation = json_object(result).get("visual_context", "")
+            observation = result.get("visual_context", "")
             if image_urls and isinstance(observation, str) and not self.routing.enabled:
                 state["visual_context"] = observation.strip()
             allowed = {d["kb_name"] for d in catalogue}
@@ -396,6 +445,7 @@ class EvidenceQAPlugin(Star):
             elif plan.source in ("kb", "both") and not plan.kb_names:
                 plan.source = "web"
             state.update(plan=plan, provider=provider, status="planned")
+            state["planning_stage"] = "answer_provider"
             if plan.route == "catalogue":
                 state["catalogue"] = catalogue
             if self.routing.enabled:
@@ -433,42 +483,23 @@ class EvidenceQAPlugin(Star):
             event.set_extra(SKIP_MEMORY, True)
             raise
         except Exception as error:  # noqa: BLE001 - native/provider boundary
-            # An image or emoji must not become silent merely because planning failed.
-            if any(attachments[k] for k in ("refs", "quotes", "faces")):
-                state.update(
-                    plan=Plan("chat" if self.routing.enabled else "delegate", question),
-                    status="planned",
-                    error=type(error).__name__,
-                    visual_fallback=True,
-                )
-                if self.routing.enabled:
-                    try:
-                        self.routing.select(state, event)
-                    except ValueError:
-                        state.update(
-                            plan=Plan("unavailable", question), status="planning_failed"
-                        )
-                if state.get("vision_provider") and not event.get_extra(
-                    "selected_provider"
-                ):
-                    event.set_extra("selected_provider", state["vision_provider"])
-                event.set_extra(SKIP_MEMORY, False)
-                logger.warning(
-                    "[证据问答 %s] 图片规划失败，保留附件交给回答模型：%s",
-                    state["trace_id"],
-                    type(error).__name__,
-                )
-                return
             state.update(
-                plan=Plan("unavailable", question),
+                plan=Plan("unavailable", question, source="none"),
                 status="planning_failed",
                 error=type(error).__name__,
+                error_detail=diagnostic(error, 600),
+                error_reply=True,
+                failure_message="[路径规划失败] 本轮未能确定处理路线，尚未完成查询或回答，请重试。",
             )
             event.set_extra(SKIP_MEMORY, True)
             self.memory.attach(self.context)
             logger.warning(
-                "[证据问答 %s] 规划失败：%s", state["trace_id"], type(error).__name__
+                "[证据问答 %s] 规划失败（%s）：%s",
+                state["trace_id"],
+                state["planning_stage"],
+                type(error).__name__,
             )
+            await self.write_trace(state, state["failure_message"])
 
     async def retrieve(self, event, query, packet, source_override=None):
         state = event.get_extra(STATE)
@@ -727,12 +758,35 @@ class EvidenceQAPlugin(Star):
                             ),
                         )
                 else:
-                    state["verification"] = "silent_no_sources"
+                    state["verification"] = "no_sources"
+                    state["failure_message"] = (
+                        "[检索失败] 本轮未能取得可用资料，请稍后重试。"
+                        if packet.errors
+                        else "[未找到相关资料] 本轮检索没有返回相关内容，可以换个问法或补充线索。"
+                    )
+            elif plan.route == "unavailable":
+                state["verification"] = "planning_failed"
         except Exception as error:  # noqa: BLE001 - native/provider boundary
-            state.update(verification="silent_error", error=type(error).__name__)
+            state.update(
+                verification="verification_error",
+                error=type(error).__name__,
+                error_detail=diagnostic(error, 600),
+            )
             logger.warning(
                 "[证据问答 %s] 核验失败：%s", state["trace_id"], type(error).__name__
             )
+        if not answer or not answer.strip():
+            messages = {
+                "unavailable": "[路径规划失败] 本轮未能确定处理路线，请重试。",
+                "catalogue": "[目录为空] 当前没有可用的资料目录缓存。",
+                "citation": "[来源不可用] 未找到这条回答对应的来源记录。",
+                "research": "[回答生成失败] 本轮未生成可用的资料回答，请重试。",
+            }
+            answer = state.get("failure_message") or messages.get(
+                plan.route, "[回答生成失败] 模型未返回可用内容，请重试。"
+            )
+            state.update(error_reply=True, failure_message=answer)
+            event.set_extra(SKIP_MEMORY, True)
         resp.result_chain = None
         resp.completion_text = answer
         resp.reasoning_content = None
@@ -791,38 +845,43 @@ class EvidenceQAPlugin(Star):
             state["elapsed_seconds"],
             state["memory_isolated"],
         )
-        if state["plan"].route in ("research", "catalogue"):
+        if state["plan"].route in ("research", "catalogue") or state.get("error_reply"):
             packet = state.get("packet", Packet(state["question"]))
             try:
-                items = state.get("items", []) if resp.completion_text else []
+                stored_answer = "" if state.get("error_reply") else resp.completion_text
+                items = state.get("items", []) if stored_answer else []
                 used = {ref["source"] for item in items for ref in item["evidence"]}
                 # Include an empty evidence record for failed turns so 'last turn'
                 # cannot silently become the preceding successful research answer.
                 self.evidence_store.save(
                     {
                         "id": state["trace_id"],
-                        "scope": state["scope"],
+                        "scope": state.get(
+                            "scope", [event.unified_msg_origin, state["trace_id"]]
+                        ),
                         "question": state["plan"].question,
                         "sender_id": state.get("sender_id", ""),
-                        "answer": resp.completion_text,
+                        "answer": stored_answer,
                         "items": items,
                         "sources": [s for s in packet.sources if s["id"] in used]
                         if items
-                        else (packet.sources if resp.completion_text else []),
+                        else (packet.sources if stored_answer else []),
                         "mode": state.get("answer_mode", "direct"),
                         "catalogue": state.get("catalogue", []),
                     }
                 )
-                if self.config.get("save_traces", True):
-                    await asyncio.to_thread(
-                        self.save_trace, state, packet, resp.completion_text
-                    )
             except (OSError, ValueError, TypeError) as error:
                 logger.warning(
                     "[证据问答 %s] 记录保存失败：%s",
                     state["trace_id"],
                     type(error).__name__,
                 )
+        if (
+            state["plan"].route in ("research", "catalogue")
+            or state.get("planning_failures")
+            or state.get("error_reply")
+        ):
+            await self.write_trace(state, resp.completion_text)
 
     async def finish_interrupted(self, event, runner, reason):
         state = event.get_extra(STATE)
@@ -832,19 +891,49 @@ class EvidenceQAPlugin(Star):
                 "trace_id": uuid4().hex,
                 "question": event.get_message_str(),
                 "started": started,
-                "plan": Plan("unavailable", event.get_message_str()),
+                "plan": Plan("unavailable", event.get_message_str(), source="none"),
             }
             event.set_extra(STATE, state)
-        state.update(status="finished", verification=reason, response_replaced=True)
+        message = (
+            "[回复超时] 本轮处理超时，未能完成回答，请重试。"
+            if "timeout" in reason
+            else "[回答生成失败] 本轮处理出错，未能完成回答，请重试。"
+        )
+        state.update(
+            status="finished",
+            verification=reason,
+            response_replaced=True,
+            error_reply=True,
+            failure_message=message,
+        )
         event.set_extra(SKIP_MEMORY, True)
-        response = LLMResponse(role="assistant", completion_text="")
-        logger.warning("[证据问答 %s] 本轮静默结束：%s", state["trace_id"], reason)
+        response = LLMResponse(role="assistant", completion_text=message)
+        logger.warning(
+            "[证据问答 %s] 本轮失败并返回提示：%s", state["trace_id"], reason
+        )
         if runner.done():
             runner.final_llm_resp = response
             await self.sync_final_history(event, runner.run_context, response)
         else:
             await runner._complete_with_assistant_response(response)
         return response
+
+    async def write_trace(self, state, answer):
+        if not self.config.get("save_traces", True):
+            return
+        try:
+            await asyncio.to_thread(
+                self.save_trace,
+                state,
+                state.get("packet", Packet(state["question"])),
+                answer,
+            )
+        except Exception as error:  # noqa: BLE001 - diagnostics must not prevent replies
+            logger.warning(
+                "[证据问答 %s] trace保存失败：%s",
+                state["trace_id"],
+                type(error).__name__,
+            )
 
     def save_trace(self, state, packet, answer):
         folder = StarTools.get_data_dir("astrbot_plugin_evidence_qa") / "traces"
@@ -855,7 +944,9 @@ class EvidenceQAPlugin(Star):
                 for k, v in state.items()
                 if k not in ("packet", "plan", "deadline")
             },
-            "plan": asdict(state["plan"]),
+            "plan": asdict(
+                state.get("plan", Plan("unavailable", state["question"], source="none"))
+            ),
             "timeouts": self.limits,
             **packet.payload(),
             "validation": packet.diagnostics,
