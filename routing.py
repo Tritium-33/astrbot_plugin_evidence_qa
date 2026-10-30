@@ -3,6 +3,7 @@
 import copy
 import json
 import sys
+from contextlib import nullcontext
 from datetime import datetime
 from functools import wraps
 from types import MethodType
@@ -205,21 +206,29 @@ class ModelRouting:
                     chat_id,
                     chat_key,
                 ):
-                    if self.enabled and self.config.get("enabled", True):
-                        if is_private and not self.owner(chat_id, platform_id):
-                            return
-                        state = {"group": not is_private, "media": {}}
-                        context = ProactiveContext(context, self, state)
-                    return await fn(
-                        cls,
-                        context,
-                        config,
-                        plugin_instance,
-                        platform_id,
-                        is_private,
-                        chat_id,
-                        chat_key,
+                    scope = (
+                        nullcontext(True)
+                        if is_private
+                        else self.plugin.group_gate.proactive(platform_id, chat_id)
                     )
+                    with scope as allowed:
+                        if not allowed:
+                            return
+                        if self.enabled and self.config.get("enabled", True):
+                            if is_private and not self.owner(chat_id, platform_id):
+                                return
+                            state = {"group": not is_private, "media": {}}
+                            context = ProactiveContext(context, self, state)
+                        return await fn(
+                            cls,
+                            context,
+                            config,
+                            plugin_instance,
+                            platform_id,
+                            is_private,
+                            chat_id,
+                            chat_key,
+                        )
 
                 return classmethod(process)
 
@@ -239,7 +248,7 @@ class ModelRouting:
 
         @wraps(original.__func__)
         async def judge(context, event, *args, **kwargs):
-            if self.blocked(event):
+            if self.plugin.group_gate.blocked(event) or self.blocked(event):
                 return False
             if self.enabled and self.plugin.enabled(event):
                 context = ProactiveContext(context, self, {})

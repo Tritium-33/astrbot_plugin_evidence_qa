@@ -122,8 +122,8 @@
   "enable_group": {
     "default": true,
     "type": "bool",
-    "hint": "接管群聊回复并启用免冷却群规则；关闭后不接管，原生或Chat Plus仍可自行回复。",
-    "description": "启用群聊"
+    "hint": "接管群聊回复并启用免冷却群规则；关闭后不接管，原生或Chat Plus仍可自行回复。按群开启或关闭发言，请使用侧栏「群聊控制」面板。",
+    "description": "接管群聊"
   },
   "no_cooldown_groups": {
     "description": "免冷却群",
