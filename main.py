@@ -29,6 +29,7 @@ from .evidence import (
     source_label,
 )
 from .group_control import GroupControl
+from .group_limit import GroupLimit
 from .integration import SelectionBridge
 from .memory import MEMORY_STEPS, SKIP_MEMORY, MemoryBridge
 from .routing import ModelRouting
@@ -71,6 +72,7 @@ class EvidenceQAPlugin(Star):
         self.evidence_store = EvidenceStore(folder / "evidence.json")
         self.routing = ModelRouting(self, folder / "routing.json")
         self.group_control = GroupControl(self, folder / "group_control.json")
+        self.group_limit = GroupLimit(self)
         self.memory = MemoryBridge()
         self.selection = SelectionBridge(self)
         BufferedChat.plugin = self

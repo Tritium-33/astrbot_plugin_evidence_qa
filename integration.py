@@ -52,7 +52,11 @@ class SelectionBridge:
                 event.stop_event()
                 return None
             if self.managed(event) and plugin_context is self.plugin.context:
+                if not self.plugin.group_limit.enter(event):
+                    return None
                 await self.plugin.plan_turn(event)
+                if not self.plugin.group_limit.acquire(event):
+                    return None
             return await original(event, plugin_context)
 
         self._patch(owner, "_select_provider", select)
@@ -105,6 +109,7 @@ class SelectionBridge:
         original_process = stage.process
         original_send = event_class.send
         control = self.plugin.group_control
+        limit = self.plugin.group_limit
 
         @wraps(original_process)
         async def process(stage_self, event):
@@ -114,18 +119,30 @@ class SelectionBridge:
                     await event.send(event.plain_result(receipt))
                     event.stop_event()
                     return
-                if control.blocked(event):
+                if control.blocked(event) or not limit.enter(event):
                     event.stop_event()
                     return
-            async for part in original_process(stage_self, event):
-                yield part
+            try:
+                async for part in original_process(stage_self, event):
+                    yield part
+            finally:
+                limit.release(event)
 
         @wraps(original_send)
         async def send(event, message):
-            if self.active and control.blocked(event):
+            if not self.active:
+                return await original_send(event, message)
+            if control.blocked(event) or not limit.acquire(event):
                 event.clear_result()
+                limit.release(event)
                 return
-            return await original_send(event, message)
+            try:
+                result = await original_send(event, message)
+            except BaseException:
+                limit.release(event)
+                raise
+            limit.sent(event)
+            return result
 
         self._patch(stage, "process", process)
         self._patch(event_class, "send", send)

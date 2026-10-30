@@ -129,7 +129,25 @@
     "description": "免冷却群",
     "type": "list",
     "default": [],
-    "hint": "每行一个群号。仅取消Chat Plus回复密度封顶、对话疲劳及注意力冷却；保留原有接话概率、DeepSeek读空气判断、@和关键词规则。不会每条必回，也不会主动唤醒消息。其他群与模型分工不变。"
+    "hint": "每行一个群号。取消统一回复上限及Chat Plus回复密度、疲劳、注意力冷却；保留原有概率、读空气判断、@和关键词规则。主人暂停仍有效，不会每条必回。"
+  },
+  "reply_limit_groups": {
+    "description": "限流群",
+    "type": "list",
+    "default": [],
+    "hint": "每行一个QQ群号。统一统计普通回复、@及关键词回复；主人管理指令除外。免冷却群优先。达到上限时丢弃新回复，不排队。"
+  },
+  "reply_limit_seconds": {
+    "description": "统计秒数",
+    "type": "float",
+    "default": 300,
+    "hint": "统一回复上限的滑动窗口秒数，至少1秒。运行中内存计数，重启或重载插件后重新统计。"
+  },
+  "reply_limit_count": {
+    "description": "回复上限",
+    "type": "int",
+    "default": 10,
+    "hint": "窗口内最多成功发送的回答次数，至少1次。同一条输入的多段回答只算一次；生成中的请求预占名额，无回复或发送失败则释放。"
   },
   "isolate_research_memory": {
     "type": "bool",

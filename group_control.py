@@ -7,6 +7,8 @@ from astrbot.core.message.components import At
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 
+from .group_limit import MANAGEMENT
+
 EPOCH = "evidence_qa.group_epoch"
 DENIED = "evidence_qa.group_denied"
 
@@ -94,12 +96,22 @@ class GroupControl:
         # A pause request containing @ must win over automatic reactivation.
         if action == "pause":
             self.set_paused(event, True)
+            event.set_extra(MANAGEMENT, True)
             return "好，先只回复你。下次你 @我就恢复本群接话。"
         if action == "resume" or (action == "none" and self.mentioned(event)):
             self.set_paused(event, False)
             if action == "resume":
+                event.set_extra(MANAGEMENT, True)
                 return "已恢复本群接话。"
         return None
+
+    @staticmethod
+    def is_command(event):
+        return any(
+            isinstance(rule, (CommandFilter, CommandGroupFilter))
+            for handler in event.get_extra("activated_handlers", [])
+            for rule in handler.event_filters
+        )
 
     def admit(self, event):
         """Called after native wake/access checks, before any plugin callbacks."""
@@ -111,15 +123,15 @@ class GroupControl:
                 return self.resolve(event, "pause" if text == "群聊暂停" else "resume")
             if not text and self.mentioned(event):
                 self.set_paused(event, False)
+                event.set_extra(MANAGEMENT, True)
             # Nonempty owner messages use the existing routing call to distinguish
             # a new pause instruction from a normal @ that resumes participation.
         else:
-            command = any(
-                isinstance(rule, (CommandFilter, CommandGroupFilter))
-                for handler in event.get_extra("activated_handlers", [])
-                for rule in handler.event_filters
-            )
-            if command or text in ("群聊暂停", "群聊恢复") or self.blocked(event):
+            if (
+                self.is_command(event)
+                or text in ("群聊暂停", "群聊恢复")
+                or self.blocked(event)
+            ):
                 event.set_extra(DENIED, True)
                 event.stop_event()
                 return None
