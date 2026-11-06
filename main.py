@@ -15,7 +15,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 
-from . import media, prompts, web
+from . import capabilities, media, prompts, web
 from .catalogue import Catalogue, EvidenceStore
 from .evidence import (
     Packet,
@@ -562,6 +562,9 @@ class EvidenceQAPlugin(Star):
         plan = state["plan"]
         if req.conversation is not None:
             state["scope"] = [event.unified_msg_origin, req.conversation.cid]
+        req.system_prompt = (req.system_prompt or "") + capabilities.describe(
+            self, event, req
+        )
         if plan.route == "delegate":
             return
         media.apply_to_request(state, req)
