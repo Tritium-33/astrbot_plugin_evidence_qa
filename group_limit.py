@@ -1,15 +1,17 @@
-"""One shared sliding-window budget for all replies in selected QQ groups."""
+"""A sliding-window budget for unsolicited replies; direct bot mentions are free."""
 
 from collections import deque
 from dataclasses import dataclass, field
 from time import monotonic
 
 from astrbot.api import logger
+from astrbot.api.message_components import At
 from astrbot.api.platform import MessageType
 
 TICKET = "evidence_qa.reply_ticket"
 LIMITED = "evidence_qa.reply_limited"
 MANAGEMENT = "evidence_qa.group_management"
+DIRECT_AT = "evidence_qa.direct_at"
 
 
 @dataclass
@@ -46,13 +48,28 @@ class GroupLimit:
             event.get_extra(MANAGEMENT, False) or control.is_command(event)
         )
 
+    @staticmethod
+    def direct_at(event):
+        mentioned = event.get_extra(DIRECT_AT)
+        if mentioned is None:
+            mentioned = (
+                event.get_platform_name() == "aiocqhttp"
+                and event.get_message_type() == MessageType.GROUP_MESSAGE
+                and any(
+                    isinstance(part, At) and str(part.qq) == str(event.get_self_id())
+                    for part in event.get_messages()
+                )
+            )
+            event.set_extra(DIRECT_AT, mentioned)
+        return mentioned
+
     def enter(self, event):
         # Let the owner's existing planner identify natural-language controls.
-        # Their ordinary chat must still acquire a slot before answer generation.
+        # Their non-mention chat must still acquire a slot before generation.
         return self.plugin.group_control.owner(event) or self.acquire(event)
 
     def acquire(self, event):
-        if not self.enabled(event) or self.management(event):
+        if not self.enabled(event) or self.management(event) or self.direct_at(event):
             return True
         if event.get_extra(LIMITED, False):
             return False
@@ -70,7 +87,7 @@ class GroupLimit:
             event.set_extra(LIMITED, True)
             event.stop_event()
             logger.info(
-                "[证据问答] 群%s 达到统一回复上限：%s秒/%d次，丢弃本轮。",
+                "[证据问答] 群%s 达到主动接话上限：%s秒/%d次，丢弃本轮。",
                 event.get_group_id(),
                 window,
                 maximum,

@@ -114,6 +114,8 @@ class SelectionBridge:
         @wraps(original_process)
         async def process(stage_self, event):
             if self.active:
+                # Snapshot the real incoming @ before GCP rewrites the message.
+                limit.direct_at(event)
                 receipt = control.admit(event)
                 if receipt:
                     await event.send(event.plain_result(receipt))
