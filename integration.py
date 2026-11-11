@@ -52,11 +52,7 @@ class SelectionBridge:
                 event.stop_event()
                 return None
             if self.managed(event) and plugin_context is self.plugin.context:
-                if not self.plugin.group_limit.enter(event):
-                    return None
                 await self.plugin.plan_turn(event)
-                if not self.plugin.group_limit.acquire(event):
-                    return None
             return await original(event, plugin_context)
 
         self._patch(owner, "_select_provider", select)
@@ -109,42 +105,29 @@ class SelectionBridge:
         original_process = stage.process
         original_send = event_class.send
         control = self.plugin.group_control
-        limit = self.plugin.group_limit
 
         @wraps(original_process)
         async def process(stage_self, event):
             if self.active:
-                # Snapshot the real incoming @ before GCP rewrites the message.
-                limit.direct_at(event)
                 receipt = control.admit(event)
                 if receipt:
                     await event.send(event.plain_result(receipt))
                     event.stop_event()
                     return
-                if control.blocked(event) or not limit.enter(event):
+                if control.blocked(event):
                     event.stop_event()
                     return
-            try:
-                async for part in original_process(stage_self, event):
-                    yield part
-            finally:
-                limit.release(event)
+            async for part in original_process(stage_self, event):
+                yield part
 
         @wraps(original_send)
         async def send(event, message):
             if not self.active:
                 return await original_send(event, message)
-            if control.blocked(event) or not limit.acquire(event):
+            if control.blocked(event):
                 event.clear_result()
-                limit.release(event)
                 return
-            try:
-                result = await original_send(event, message)
-            except BaseException:
-                limit.release(event)
-                raise
-            limit.sent(event)
-            return result
+            return await original_send(event, message)
 
         self._patch(stage, "process", process)
         self._patch(event_class, "send", send)

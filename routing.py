@@ -10,8 +10,6 @@ from types import MethodType
 from astrbot.api import logger
 from astrbot.api.platform import MessageType
 
-from .group_policy import GroupPolicy
-
 GPT_ROLES = {
     "private": ("gpt_private_provider_id", "private_effort", "low"),
     "chat": ("gpt_chat_provider_id", "chat_effort", "low"),
@@ -47,7 +45,6 @@ class ModelRouting:
         self.reason = "default"
         self.gcp_patches = []
         self.active = True
-        self.groups = GroupPolicy(plugin)
 
     @property
     def enabled(self):
@@ -177,8 +174,6 @@ class ModelRouting:
         if not self.active:
             return
         for name, module in list(sys.modules.items()):
-            if "group_chat_plus" in name:
-                self.groups.attach(module, name)
             if "group_chat_plus" in name and name.endswith(".utils.decision_ai"):
                 self._attach_decision(module)
             if "group_chat_plus" not in name or not name.endswith(
@@ -254,7 +249,6 @@ class ModelRouting:
 
     def close(self):
         self.active = False
-        self.groups.close()
         for owner, name, original, replacement in reversed(self.gcp_patches):
             if owner.__dict__.get(name) is replacement:
                 setattr(owner, name, original)

@@ -7,7 +7,7 @@ from astrbot.core.message.components import At
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 
-from .group_limit import MANAGEMENT
+MANAGEMENT = "evidence_qa.group_management"
 
 EPOCH = "evidence_qa.group_epoch"
 DENIED = "evidence_qa.group_denied"
