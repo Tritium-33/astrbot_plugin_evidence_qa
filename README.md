@@ -1,6 +1,6 @@
 # 证据问答与会话路由
 
-[群聊控制面板](GROUP_CONTROL.md) · [模型分工与配置](MODELS.md) · [群聊与图片配置](GROUP_CHAT_PLUS.md) · [更新日志](CHANGELOG.md)
+[群聊控制面板](GROUP_CONTROL.md) · [模型分工与配置](MODELS.md) · [群聊与图片配置](GROUP_CHAT_PLUS.md) · [自然接话](NATURAL_CHAT.md) · [更新日志](CHANGELOG.md)
 
 适用于 AstrBot 4.29.3 的私聊、群聊与 WebChat。按消息选择自然聊天、本地原生知识库或联网查询。GPT 生成面向用户的主回答，DeepSeek 处理规划与辅助任务；默认简短聊天、按需给来源。源码只包含插件功能与使用文档。
 
